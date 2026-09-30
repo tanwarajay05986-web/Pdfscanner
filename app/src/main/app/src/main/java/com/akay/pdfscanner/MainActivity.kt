@@ -7,6 +7,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
+import android.widget.ScrollView
+import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -36,6 +38,27 @@ import java.util.Locale
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val prefs = getSharedPreferences("crash", Context.MODE_PRIVATE)
+        val oldCrash = prefs.getString("log", null)
+        if (oldCrash != null) {
+            prefs.edit().remove("log").apply()
+            val tv = TextView(this)
+            tv.text = "CRASH LOG (screenshot bhejo):\n\n" + oldCrash
+            tv.textSize = 11f
+            tv.setPadding(24, 90, 24, 24)
+            val sv = ScrollView(this)
+            sv.addView(tv)
+            setContentView(sv)
+            return
+        }
+
+        Thread.setDefaultUncaughtExceptionHandler { _, e ->
+            prefs.edit().putString("log", android.util.Log.getStackTraceString(e)).commit()
+            android.os.Process.killProcess(android.os.Process.myPid())
+            System.exit(1)
+        }
+
         setContent {
             MaterialTheme(
                 colorScheme = lightColorScheme(
@@ -71,19 +94,6 @@ fun PdfScannerApp() {
     val context = LocalContext.current
     var status by remember { mutableStateOf("Scan shuru karne ke liye button dabao") }
     val saved = remember { mutableStateListOf<String>() }
-
-    val scanner = remember {
-        val options = GmsDocumentScannerOptions.Builder()
-            .setGalleryImportAllowed(true)
-            .setPageLimit(50)
-            .setResultFormats(
-                GmsDocumentScannerOptions.RESULT_FORMAT_JPEG,
-                GmsDocumentScannerOptions.RESULT_FORMAT_PDF
-            )
-            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
-            .build()
-        GmsDocumentScanning.getClient(options)
-    }
 
     val launcher = rememberLauncherForActivityResult(
         ActivityResultContracts.StartIntentSenderForResult()
@@ -123,11 +133,25 @@ fun PdfScannerApp() {
         ) {
             Button(
                 onClick = {
-                    scanner.getStartScanIntent(context as Activity)
-                        .addOnSuccessListener { sender ->
-                            launcher.launch(IntentSenderRequest.Builder(sender).build())
-                        }
-                        .addOnFailureListener { status = "Error: ${it.message}" }
+                    try {
+                        val options = GmsDocumentScannerOptions.Builder()
+                            .setGalleryImportAllowed(true)
+                            .setPageLimit(50)
+                            .setResultFormats(
+                                GmsDocumentScannerOptions.RESULT_FORMAT_JPEG,
+                                GmsDocumentScannerOptions.RESULT_FORMAT_PDF
+                            )
+                            .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
+                            .build()
+                        GmsDocumentScanning.getClient(options)
+                            .getStartScanIntent(context as Activity)
+                            .addOnSuccessListener { sender ->
+                                launcher.launch(IntentSenderRequest.Builder(sender).build())
+                            }
+                            .addOnFailureListener { status = "Error: ${it.message}" }
+                    } catch (e: Exception) {
+                        status = "Error: ${e.message}"
+                    }
                 },
                 modifier = Modifier.fillMaxWidth().height(60.dp),
                 shape = RoundedCornerShape(16.dp)
