@@ -1,119 +1,73 @@
 package com.akay.pdfscanner
 
-import android.app.Activity
-import android.app.AlertDialog
-import android.content.ContentValues
-import android.content.Intent
+import android.Manifest
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
-import android.provider.MediaStore
 import android.view.Gravity
 import android.view.View
-import android.widget.*
+import android.widget.FrameLayout
+import android.widget.HorizontalScrollView
+import android.widget.ImageView
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
-import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.contract.ActivityResultContracts
-import com.google.mlkit.vision.documentscanner.GmsDocumentScannerOptions
-import com.google.mlkit.vision.documentscanner.GmsDocumentScanning
-import com.google.mlkit.vision.documentscanner.GmsDocumentScanningResult
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.FileOutputStream
-import java.io.OutputStream
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
-
-fun buildPdf(files: List<File>, out: OutputStream) {
-    val offsets = ArrayList<Long>()
-    var pos = 0L
-    fun w(s: String) {
-        val b = s.toByteArray(Charsets.ISO_8859_1)
-        out.write(b)
-        pos += b.size
-    }
-    fun wb(b: ByteArray) {
-        out.write(b)
-        pos += b.size
-    }
-    val n = files.size
-    w("%PDF-1.4\n")
-    offsets.add(pos)
-    w("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
-    offsets.add(pos)
-    val kids = (0 until n).joinToString(" ") { "${3 + 3 * it} 0 R" }
-    w("2 0 obj\n<< /Type /Pages /Kids [$kids] /Count $n >>\nendobj\n")
-    for (i in 0 until n) {
-        val opts = BitmapFactory.Options()
-        opts.inJustDecodeBounds = true
-        BitmapFactory.decodeFile(files[i].absolutePath, opts)
-        val iw = opts.outWidth
-        val ih = opts.outHeight
-        if (iw <= 0 || ih <= 0) throw IllegalStateException("Bad image")
-        val pw = 595f
-        val ph = pw * ih / iw
-        val jpg = files[i].readBytes()
-        val po = 3 + 3 * i
-        offsets.add(pos)
-        w("$po 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 $pw $ph] /Resources << /XObject << /Im0 ${po + 2} 0 R >> >> /Contents ${po + 1} 0 R >>\nendobj\n")
-        val content = "q $pw 0 0 $ph 0 0 cm /Im0 Do Q"
-        offsets.add(pos)
-        w("${po + 1} 0 obj\n<< /Length ${content.length} >>\nstream\n$content\nendstream\nendobj\n")
-        offsets.add(pos)
-        w("${po + 2} 0 obj\n<< /Type /XObject /Subtype /Image /Width $iw /Height $ih /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.size} >>\nstream\n")
-        wb(jpg)
-        w("\nendstream\nendobj\n")
-    }
-    val xrefPos = pos
-    w("xref\n0 ${offsets.size + 1}\n")
-    w("0000000000 65535 f \n")
-    for (o in offsets) {
-        w(String.format(Locale.US, "%010d 00000 n \n", o))
-    }
-    w("trailer\n<< /Size ${offsets.size + 1} /Root 1 0 R >>\nstartxref\n$xrefPos\n%%EOF\n")
-    out.flush()
-}
+import java.util.concurrent.Executors
 
 class MainActivity : ComponentActivity() {
 
-    private val BLUE = Color.parseColor("#0288D1")
-    private val LIGHT = Color.parseColor("#D6EEFF")
-    private val BG = Color.parseColor("#F3F9FF")
-    private val GREEN = Color.parseColor("#2E7D32")
+    private val DARK = Color.parseColor("#1C1C1C")
+    private val GREEN = Color.parseColor("#2E9E5B")
     private val MATCH = LinearLayout.LayoutParams.MATCH_PARENT
     private val WRAP = LinearLayout.LayoutParams.WRAP_CONTENT
 
     private val pages = ArrayList<File>()
-    private var screen = "home"
-    private var savedUri: Uri? = null
-    private var savedName = ""
+    private var screen = "camera"
+    private var pending = 0
+    private var torchOn = false
+    private var camera: Camera? = null
+    private var imageCapture: ImageCapture? = null
+    private var previewView: PreviewView? = null
+    private var thumbBox: FrameLayout? = null
+    private var thumbImg: ImageView? = null
+    private var thumbBadge: TextView? = null
+    private var proceedBadge: TextView? = null
+    private val worker = Executors.newSingleThreadExecutor()
 
-    private val launcher = registerForActivityResult(
-        ActivityResultContracts.StartIntentSenderForResult()
-    ) { result ->
-        try {
-            if (result.resultCode == Activity.RESULT_OK) {
-                val scan = GmsDocumentScanningResult.fromActivityResultIntent(result.data)
-                val list = scan?.pages
-                if (list != null) {
-                    for (p in list) {
-                        val f = importPage(p.imageUri)
-                        if (f != null) pages.add(f)
-                    }
-                    showEditor()
-                }
-            }
-        } catch (e: Throwable) {
-            toast("Error: $e")
-        }
+    private val permLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { ok ->
+        if (ok) startCamera() else toast("Camera permission chahiye. Phone Settings mein allow karo.")
     }
+
+    private val galleryLauncher = registerForActivityResult(
+        ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        if (uris.isNotEmpty()) importUris(uris)
+    }
+
+    // ---------- helpers ----------
 
     private fun toast(m: String) {
         Toast.makeText(this, m, Toast.LENGTH_LONG).show()
@@ -121,58 +75,41 @@ class MainActivity : ComponentActivity() {
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
-    private fun stamp(): String =
-        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
-
-    private fun rounded(color: Int, radius: Int, stroke: Int? = null): GradientDrawable {
-        val d = GradientDrawable()
-        d.setColor(color)
-        d.cornerRadius = dp(radius).toFloat()
-        if (stroke != null) d.setStroke(dp(2), stroke)
-        return d
-    }
-
     private fun lp(w: Int, h: Int, weight: Float = 0f): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(w, h, weight)
 
-    private fun makeButton(
-        text: String, bg: Int, fg: Int, stroke: Int? = null, onClick: () -> Unit
-    ): Button {
-        val b = Button(this)
-        b.text = text
-        b.isAllCaps = false
-        b.textSize = 16f
-        b.setTextColor(fg)
-        b.background = rounded(bg, 14, stroke)
-        b.setOnClickListener { onClick() }
-        return b
+    private fun rounded(color: Int, radius: Int): GradientDrawable {
+        val d = GradientDrawable()
+        d.setColor(color)
+        d.cornerRadius = dp(radius).toFloat()
+        return d
     }
 
-    private fun header(title: String, sub: String): View {
-        val h = LinearLayout(this)
-        h.orientation = LinearLayout.VERTICAL
-        h.setBackgroundColor(BLUE)
-        h.setPadding(dp(24), dp(44), dp(24), dp(20))
+    private fun oval(color: Int): GradientDrawable {
+        val d = GradientDrawable()
+        d.shape = GradientDrawable.OVAL
+        d.setColor(color)
+        return d
+    }
+
+    private fun badge(): TextView {
         val t = TextView(this)
-        t.text = title
-        t.textSize = 26f
+        t.textSize = 12f
         t.setTextColor(Color.WHITE)
         t.setTypeface(null, Typeface.BOLD)
-        h.addView(t)
-        val s = TextView(this)
-        s.text = sub
-        s.textSize = 14f
-        s.setTextColor(LIGHT)
-        h.addView(s)
-        return h
+        t.gravity = Gravity.CENTER
+        t.background = oval(Color.parseColor("#C62828"))
+        return t
     }
 
-    private fun label(text: String, size: Float, color: Int, bold: Boolean = false): TextView {
+    private fun iconText(text: String, size: Float, onClick: () -> Unit): TextView {
         val t = TextView(this)
         t.text = text
         t.textSize = size
-        t.setTextColor(color)
-        if (bold) t.setTypeface(null, Typeface.BOLD)
+        t.setTextColor(Color.WHITE)
+        t.gravity = Gravity.CENTER
+        t.setPadding(dp(16), dp(10), dp(16), dp(10))
+        t.setOnClickListener { onClick() }
         return t
     }
 
@@ -182,13 +119,23 @@ class MainActivity : ComponentActivity() {
         return d
     }
 
-    private fun clearPages() {
-        for (f in pages) f.delete()
-        pages.clear()
+    private fun exifDegrees(ei: ExifInterface): Int {
+        return when (ei.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270
+            else -> 0
+        }
     }
 
-    private fun importPage(uri: Uri): File? {
+    // photo/gallery image ko seedha karke (EXIF rotate) chhota JPEG bana deta hai
+    private fun importFromUri(uri: Uri): File? {
         return try {
+            val deg = try {
+                contentResolver.openInputStream(uri)?.use { exifDegrees(ExifInterface(it)) } ?: 0
+            } catch (e: Throwable) {
+                0
+            }
             val opts = BitmapFactory.Options()
             opts.inJustDecodeBounds = true
             contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, opts) }
@@ -197,11 +144,18 @@ class MainActivity : ComponentActivity() {
             while (maxSide / sample > 2400) sample *= 2
             val o2 = BitmapFactory.Options()
             o2.inSampleSize = sample
-            val bmp = contentResolver.openInputStream(uri)?.use {
+            var bmp = contentResolver.openInputStream(uri)?.use {
                 BitmapFactory.decodeStream(it, null, o2)
             } ?: return null
+            if (deg != 0) {
+                val m = Matrix()
+                m.postRotate(deg.toFloat())
+                val r = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                bmp.recycle()
+                bmp = r
+            }
             val f = File(pagesDir(), "p_${System.nanoTime()}.jpg")
-            FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 88, it) }
+            FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.JPEG, 90, it) }
             bmp.recycle()
             f
         } catch (e: Throwable) {
@@ -209,13 +163,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun thumb(f: File): Bitmap? {
+    private fun thumb(f: File, maxSide: Int): Bitmap? {
         return try {
             val o = BitmapFactory.Options()
             o.inJustDecodeBounds = true
             BitmapFactory.decodeFile(f.absolutePath, o)
             var s = 1
-            while (maxOf(o.outWidth, o.outHeight) / s > 500) s *= 2
+            while (maxOf(o.outWidth, o.outHeight) / s > maxSide) s *= 2
             val o2 = BitmapFactory.Options()
             o2.inSampleSize = s
             BitmapFactory.decodeFile(f.absolutePath, o2)
@@ -224,310 +178,316 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startScan(limit: Int) {
-        try {
-            val options = GmsDocumentScannerOptions.Builder()
-                .setGalleryImportAllowed(true)
-                .setPageLimit(limit)
-                .setResultFormats(GmsDocumentScannerOptions.RESULT_FORMAT_JPEG)
-                .setScannerMode(GmsDocumentScannerOptions.SCANNER_MODE_FULL)
-                .build()
-            GmsDocumentScanning.getClient(options)
-                .getStartScanIntent(this)
-                .addOnSuccessListener { sender ->
-                    launcher.launch(IntentSenderRequest.Builder(sender).build())
-                }
-                .addOnFailureListener { toast("Scanner error: ${it.message}") }
-        } catch (e: Throwable) {
-            toast("Error: $e")
-        }
-    }
+    // ---------- camera ----------
 
-    private fun cleanName(raw: String): String {
-        var n = raw.trim().replace(Regex("[\\\\/:*?\"<>|]"), "_")
-        if (n.isEmpty()) n = "Scan_" + stamp()
-        if (!n.lowercase(Locale.ROOT).endsWith(".pdf")) n += ".pdf"
-        return n
-    }
-
-    private fun savePdfToDownloads(name: String, files: List<File>): Uri? {
-        return try {
-            val values = ContentValues()
-            values.put(MediaStore.Downloads.DISPLAY_NAME, name)
-            values.put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
-            values.put(
-                MediaStore.Downloads.RELATIVE_PATH,
-                Environment.DIRECTORY_DOWNLOADS + "/PDFScanner"
-            )
-            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                ?: return null
-            contentResolver.openOutputStream(uri)?.buffered()?.use { buildPdf(files, it) }
-            uri
-        } catch (e: Throwable) {
-            null
-        }
-    }
-
-    private fun renameSaved(uri: Uri, newName: String): Boolean {
-        return try {
-            val v = ContentValues()
-            v.put(MediaStore.Downloads.DISPLAY_NAME, newName)
-            contentResolver.update(uri, v, null, null) > 0
-        } catch (e: Throwable) {
-            false
-        }
-    }
-
-    private fun rotatePage(i: Int) {
-        try {
-            val f = pages[i]
-            val bmp = BitmapFactory.decodeFile(f.absolutePath)
-            if (bmp != null) {
-                val m = Matrix()
-                m.postRotate(90f)
-                val r = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
-                FileOutputStream(f).use { r.compress(Bitmap.CompressFormat.JPEG, 88, it) }
-                bmp.recycle()
-                r.recycle()
-            }
-        } catch (e: Throwable) {
-            toast("Rotate error: $e")
-        }
-        showEditor()
-    }
-
-    private fun deletePage(i: Int) {
-        pages[i].delete()
-        pages.removeAt(i)
-        showEditor()
-    }
-
-    private fun askNameAndSave() {
-        val et = EditText(this)
-        et.setText("Scan_" + stamp())
-        et.setSelectAllOnFocus(true)
-        val box = FrameLayout(this)
-        box.setPadding(dp(20), dp(8), dp(20), 0)
-        box.addView(et)
-        AlertDialog.Builder(this)
-            .setTitle("PDF ka naam")
-            .setView(box)
-            .setPositiveButton("Save") { _, _ -> doSave(et.text.toString()) }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun doSave(raw: String) {
-        val name = cleanName(raw)
-        val snapshot = pages.toList()
-        toast("Save ho rahi hai...")
-        Thread {
-            val uri = try {
-                savePdfToDownloads(name, snapshot)
+    private fun startCamera() {
+        val pv = previewView ?: return
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            try {
+                val provider = future.get()
+                val preview = Preview.Builder().build()
+                preview.setSurfaceProvider(pv.surfaceProvider)
+                val ic = ImageCapture.Builder().build()
+                imageCapture = ic
+                provider.unbindAll()
+                camera = provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, ic)
+                camera?.cameraControl?.enableTorch(torchOn)
             } catch (e: Throwable) {
-                null
+                toast("Camera error: $e")
             }
-            runOnUiThread {
-                if (uri != null) showResult(uri, name) else toast("Save nahi ho paya")
-            }
-        }.start()
+        }, ContextCompat.getMainExecutor(this))
     }
 
-    private fun askRename() {
-        val uri = savedUri ?: return
-        val et = EditText(this)
-        et.setText(savedName.removeSuffix(".pdf"))
-        et.setSelectAllOnFocus(true)
-        val box = FrameLayout(this)
-        box.setPadding(dp(20), dp(8), dp(20), 0)
-        box.addView(et)
-        AlertDialog.Builder(this)
-            .setTitle("Naya naam")
-            .setView(box)
-            .setPositiveButton("Rename") { _, _ ->
-                val newName = cleanName(et.text.toString())
-                if (renameSaved(uri, newName)) {
-                    showResult(uri, newName)
-                } else {
-                    toast("Rename nahi ho paya")
-                }
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun sharePdf() {
+    private fun stopCamera() {
         try {
-            val uri = savedUri ?: return
-            val i = Intent(Intent.ACTION_SEND)
-            i.type = "application/pdf"
-            i.putExtra(Intent.EXTRA_STREAM, uri)
-            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            startActivity(Intent.createChooser(i, "Share PDF"))
+            ProcessCameraProvider.getInstance(this).get().unbindAll()
         } catch (e: Throwable) {
-            toast("Share error: $e")
         }
+        camera = null
+        imageCapture = null
     }
 
-    private fun viewPdf() {
-        try {
-            val uri = savedUri ?: return
-            val i = Intent(Intent.ACTION_VIEW)
-            i.setDataAndType(uri, "application/pdf")
-            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            startActivity(i)
-        } catch (e: Throwable) {
-            toast("PDF viewer nahi mila. Files app se Downloads/PDFScanner kholo.")
-        }
-    }
-
-    private fun showHome() {
-        screen = "home"
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(BG)
-        root.addView(header("PDF Scanner v3", "Scan. Edit. Save as PDF."))
-        val body = LinearLayout(this)
-        body.orientation = LinearLayout.VERTICAL
-        body.setPadding(dp(20), dp(24), dp(20), dp(20))
-        body.addView(
-            makeButton("Naya Scan Karo", BLUE, Color.WHITE) {
-                clearPages()
-                startScan(50)
-            },
-            lp(MATCH, dp(60))
-        )
-        if (pages.isNotEmpty()) {
-            val b = makeButton("Pages edit karo (${pages.size})", Color.WHITE, BLUE, BLUE) {
-                showEditor()
-            }
-            body.addView(b, lp(MATCH, dp(56)).apply { topMargin = dp(12) })
-        }
-        val note = label(
-            "Camera, flash, gallery, crop aur filters scanner screen mein milenge.",
-            13f, Color.parseColor("#455A64")
-        )
-        note.setPadding(0, dp(16), 0, 0)
-        body.addView(note)
-        root.addView(body)
-        setContentView(root)
-    }
-
-    private fun showEditor() {
-        if (pages.isEmpty()) {
-            showHome()
+    private fun toggleTorch(btn: TextView) {
+        val cam = camera
+        if (cam == null) {
+            toast("Camera abhi ready nahi hai")
             return
         }
-        screen = "editor"
+        if (!cam.cameraInfo.hasFlashUnit()) {
+            toast("Is phone mein flash nahi hai")
+            return
+        }
+        torchOn = !torchOn
+        cam.cameraControl.enableTorch(torchOn)
+        btn.text = if (torchOn) "Flash ON" else "Flash OFF"
+        btn.setTextColor(if (torchOn) Color.YELLOW else Color.WHITE)
+    }
+
+    private fun takePhoto() {
+        val ic = imageCapture
+        if (ic == null) {
+            toast("Camera abhi ready nahi hai")
+            return
+        }
+        val raw = File(pagesDir(), "raw_${System.nanoTime()}.jpg")
+        val options = ImageCapture.OutputFileOptions.Builder(raw).build()
+        pending += 1
+        ic.takePicture(
+            options,
+            ContextCompat.getMainExecutor(this),
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    worker.execute {
+                        val f = importFromUri(Uri.fromFile(raw))
+                        raw.delete()
+                        runOnUiThread {
+                            pending -= 1
+                            if (f != null) pages.add(f) else toast("Photo save nahi ho payi")
+                            if (screen == "camera") refreshOverlay()
+                        }
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    pending -= 1
+                    toast("Capture error: ${exception.message}")
+                }
+            }
+        )
+    }
+
+    private fun importUris(uris: List<Uri>) {
+        pending += 1
+        worker.execute {
+            val added = ArrayList<File>()
+            for (u in uris) {
+                val f = importFromUri(u)
+                if (f != null) added.add(f)
+            }
+            runOnUiThread {
+                pages.addAll(added)
+                pending -= 1
+                if (screen == "camera") refreshOverlay()
+                if (added.size < uris.size) toast("Kuch images load nahi ho payi")
+            }
+        }
+    }
+
+    private fun removeLast() {
+        if (pages.isNotEmpty()) {
+            pages.removeAt(pages.size - 1).delete()
+            refreshOverlay()
+        }
+    }
+
+    private fun refreshOverlay() {
+        val n = pages.size
+        thumbBox?.visibility = if (n == 0) View.GONE else View.VISIBLE
+        proceedBadge?.visibility = if (n == 0) View.GONE else View.VISIBLE
+        if (n > 0) {
+            thumbImg?.setImageBitmap(thumb(pages[n - 1], 300))
+            thumbBadge?.text = n.toString()
+            proceedBadge?.text = n.toString()
+        }
+    }
+
+    private fun proceed() {
+        if (pending > 0) {
+            toast("Ruko, photo process ho rahi hai...")
+            return
+        }
+        if (pages.isEmpty()) {
+            toast("Pehle kam se kam 1 page capture karo")
+            return
+        }
+        showNext()
+    }
+
+    // ---------- screens ----------
+
+    private fun showCamera() {
+        screen = "camera"
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(BG)
-        root.addView(header("Pages (${pages.size})", "Rotate ya delete karo, phir Proceed dabao"))
+        root.setBackgroundColor(DARK)
 
-        val list = LinearLayout(this)
-        list.orientation = LinearLayout.VERTICAL
-        list.setPadding(dp(16), dp(8), dp(16), dp(8))
-        for (i in pages.indices) list.addView(pageCard(i))
-        val sv = ScrollView(this)
-        sv.addView(list)
-        root.addView(sv, lp(MATCH, 0, 1f))
+        // top bar: close (left) + flash (right)
+        val top = FrameLayout(this)
+        top.setPadding(dp(8), dp(24), dp(8), dp(4))
+        top.addView(
+            iconText("X", 22f) { finish() },
+            FrameLayout.LayoutParams(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL)
+        )
+        val flash = iconText(if (torchOn) "Flash ON" else "Flash OFF", 15f) { }
+        flash.setTextColor(if (torchOn) Color.YELLOW else Color.WHITE)
+        flash.setOnClickListener { toggleTorch(flash) }
+        top.addView(
+            flash,
+            FrameLayout.LayoutParams(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL)
+        )
+        root.addView(top, lp(MATCH, dp(76)))
 
+        // preview + thumbnail overlay
+        val container = FrameLayout(this)
+        val pv = PreviewView(this)
+        pv.scaleType = PreviewView.ScaleType.FIT_CENTER
+        previewView = pv
+        container.addView(pv, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        val tb = FrameLayout(this)
+        val img = ImageView(this)
+        img.scaleType = ImageView.ScaleType.CENTER_CROP
+        img.setPadding(dp(3), dp(3), dp(3), dp(3))
+        img.background = rounded(Color.WHITE, 12)
+        thumbImg = img
+        tb.addView(img, FrameLayout.LayoutParams(dp(84), dp(104), Gravity.BOTTOM or Gravity.START))
+        val tbBadge = badge()
+        thumbBadge = tbBadge
+        tb.addView(tbBadge, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.TOP or Gravity.START))
+        val x = TextView(this)
+        x.text = "X"
+        x.textSize = 12f
+        x.setTextColor(Color.BLACK)
+        x.setTypeface(null, Typeface.BOLD)
+        x.gravity = Gravity.CENTER
+        x.background = oval(Color.WHITE)
+        x.setOnClickListener { removeLast() }
+        tb.addView(x, FrameLayout.LayoutParams(dp(26), dp(26), Gravity.TOP or Gravity.END))
+        thumbBox = tb
+        val tlp = FrameLayout.LayoutParams(dp(96), dp(116), Gravity.BOTTOM or Gravity.START)
+        tlp.setMargins(dp(10), 0, 0, dp(10))
+        container.addView(tb, tlp)
+        root.addView(container, lp(MATCH, 0, 1f))
+
+        // bottom bar: gallery | capture | proceed
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.HORIZONTAL
-        bar.setBackgroundColor(Color.WHITE)
-        bar.setPadding(dp(16), dp(12), dp(16), dp(16))
-        val add = makeButton("Add Page", Color.WHITE, BLUE, BLUE) {
-            if (pages.size >= 50) toast("Maximum 50 pages") else startScan(50 - pages.size)
-        }
-        val go = makeButton("Proceed", GREEN, Color.WHITE) { askNameAndSave() }
-        bar.addView(add, lp(0, dp(56), 1f).apply { rightMargin = dp(8) })
-        bar.addView(go, lp(0, dp(56), 1f).apply { leftMargin = dp(8) })
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.setPadding(dp(16), dp(12), dp(16), dp(20))
+
+        val gallery = TextView(this)
+        gallery.text = "Gallery"
+        gallery.textSize = 12f
+        gallery.setTextColor(Color.WHITE)
+        gallery.gravity = Gravity.CENTER
+        gallery.background = rounded(Color.parseColor("#3A3A3A"), 16)
+        gallery.setOnClickListener { galleryLauncher.launch("image/*") }
+        bar.addView(gallery, lp(dp(72), dp(72)))
+
+        bar.addView(View(this), lp(0, 1, 1f))
+
+        val cap = View(this)
+        val capBg = GradientDrawable()
+        capBg.shape = GradientDrawable.OVAL
+        capBg.setColor(Color.WHITE)
+        capBg.setStroke(dp(5), Color.parseColor("#9E9E9E"))
+        cap.background = capBg
+        cap.setOnClickListener { takePhoto() }
+        bar.addView(cap, lp(dp(76), dp(76)))
+
+        bar.addView(View(this), lp(0, 1, 1f))
+
+        val pw = FrameLayout(this)
+        val pbtn = TextView(this)
+        pbtn.text = "Proceed"
+        pbtn.textSize = 15f
+        pbtn.setTextColor(Color.WHITE)
+        pbtn.setTypeface(null, Typeface.BOLD)
+        pbtn.gravity = Gravity.CENTER
+        pbtn.background = rounded(GREEN, 32)
+        pbtn.setOnClickListener { proceed() }
+        pw.addView(pbtn, FrameLayout.LayoutParams(dp(112), dp(64), Gravity.CENTER))
+        val pb = badge()
+        proceedBadge = pb
+        pw.addView(pb, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.TOP or Gravity.END))
+        bar.addView(pw, lp(dp(124), dp(80)))
+
         root.addView(bar)
         setContentView(root)
+        refreshOverlay()
+
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
+            == PackageManager.PERMISSION_GRANTED
+        ) {
+            startCamera()
+        } else {
+            permLauncher.launch(Manifest.permission.CAMERA)
+        }
     }
 
-    private fun pageCard(i: Int): View {
-        val card = LinearLayout(this)
-        card.orientation = LinearLayout.HORIZONTAL
-        card.gravity = Gravity.CENTER_VERTICAL
-        card.setPadding(dp(12), dp(12), dp(12), dp(12))
-        card.background = rounded(Color.WHITE, 14)
-        card.layoutParams = lp(MATCH, WRAP).apply { topMargin = dp(10) }
-
-        val img = ImageView(this)
-        img.scaleType = ImageView.ScaleType.FIT_CENTER
-        val tb = thumb(pages[i])
-        if (tb != null) img.setImageBitmap(tb)
-        card.addView(img, lp(dp(90), dp(120)))
-
-        val col = LinearLayout(this)
-        col.orientation = LinearLayout.VERTICAL
-        col.setPadding(dp(14), 0, 0, 0)
-        col.addView(label("Page ${i + 1}", 17f, Color.parseColor("#01579B"), true))
-
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.setPadding(0, dp(8), 0, 0)
-        row.addView(makeButton("Rotate", LIGHT, BLUE) { rotatePage(i) }, lp(WRAP, dp(44)))
-        row.addView(
-            makeButton("Delete", Color.parseColor("#FDECEA"), Color.parseColor("#C62828")) {
-                deletePage(i)
-            },
-            lp(WRAP, dp(44)).apply { leftMargin = dp(8) }
-        )
-        col.addView(row)
-        card.addView(col)
-        return card
-    }
-
-    private fun showResult(uri: Uri, name: String) {
-        screen = "result"
-        savedUri = uri
-        savedName = name
+    // Stage 1 ka placeholder: Stage 2 mein yahan Crop + Filters aayenge
+    private fun showNext() {
+        screen = "next"
+        stopCamera()
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(BG)
-        root.addView(header("PDF save ho gayi", "Downloads/PDFScanner"))
-        val body = LinearLayout(this)
-        body.orientation = LinearLayout.VERTICAL
-        body.setPadding(dp(20), dp(20), dp(20), dp(20))
-        body.addView(label(name, 18f, Color.parseColor("#01579B"), true))
-        val cnt = label("${pages.size} pages", 14f, Color.parseColor("#455A64"))
-        cnt.setPadding(0, dp(4), 0, dp(16))
-        body.addView(cnt)
+        root.setBackgroundColor(Color.parseColor("#F3F9FF"))
+        root.setPadding(dp(24), dp(60), dp(24), dp(24))
 
-        fun add(b: Button) {
-            body.addView(b, lp(MATCH, dp(54)).apply { topMargin = dp(10) })
+        val t = TextView(this)
+        t.text = "Stage 1 pass"
+        t.textSize = 26f
+        t.setTypeface(null, Typeface.BOLD)
+        t.setTextColor(Color.parseColor("#01579B"))
+        root.addView(t)
+
+        val c = TextView(this)
+        c.text = "${pages.size} page(s) ready. Crop aur Filters agle stage mein aayenge."
+        c.textSize = 15f
+        c.setTextColor(Color.parseColor("#455A64"))
+        c.setPadding(0, dp(8), 0, dp(16))
+        root.addView(c)
+
+        val hs = HorizontalScrollView(this)
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        for (p in pages) {
+            val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.CENTER_CROP
+            iv.setImageBitmap(thumb(p, 300))
+            val l = lp(dp(100), dp(140))
+            l.rightMargin = dp(8)
+            row.addView(iv, l)
         }
-        add(makeButton("Share", BLUE, Color.WHITE) { sharePdf() })
-        add(makeButton("View PDF", Color.WHITE, BLUE, BLUE) { viewPdf() })
-        add(makeButton("Rename", Color.WHITE, BLUE, BLUE) { askRename() })
-        add(makeButton("Pages edit karo", Color.WHITE, BLUE, BLUE) { showEditor() })
-        add(makeButton("Done", GREEN, Color.WHITE) {
-            clearPages()
-            showHome()
-        })
-        root.addView(body)
+        hs.addView(row)
+        root.addView(hs)
+
+        val back = TextView(this)
+        back.text = "Camera par wapas"
+        back.textSize = 16f
+        back.setTextColor(Color.WHITE)
+        back.gravity = Gravity.CENTER
+        back.background = rounded(Color.parseColor("#0288D1"), 14)
+        back.setOnClickListener { showCamera() }
+        val bl = lp(MATCH, dp(56))
+        bl.topMargin = dp(24)
+        root.addView(back, bl)
         setContentView(root)
+    }
+
+    private fun showError(e: Throwable) {
+        val tv = TextView(this)
+        tv.text = "ERROR (screenshot bhejo):\n\n" + android.util.Log.getStackTraceString(e)
+        tv.textSize = 11f
+        tv.setPadding(24, 90, 24, 24)
+        val sv = ScrollView(this)
+        sv.addView(tv)
+        setContentView(sv)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        pagesDir().listFiles()?.forEach { it.delete() }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (screen == "editor" || screen == "result") showHome() else finish()
+                if (screen == "camera") finish() else showCamera()
             }
         })
         try {
-            showHome()
+            showCamera()
         } catch (e: Throwable) {
-            val tv = TextView(this)
-            tv.text = "ERROR (screenshot bhejo):\n\n" + android.util.Log.getStackTraceString(e)
-            tv.textSize = 11f
-            tv.setPadding(24, 90, 24, 24)
-            val sv = ScrollView(this)
-            sv.addView(tv)
-            setContentView(sv)
+            showError(e)
         }
     }
 }
