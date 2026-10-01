@@ -1,17 +1,26 @@
 package com.akay.pdfscanner
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorFilter
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -34,15 +43,151 @@ import androidx.core.content.ContextCompat
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
+import kotlin.math.hypot
+
+// ---------- Crop view: 8 blue handles ----------
+class CropView(context: Context) : View(context) {
+    var bitmap: Bitmap? = null
+    var filter: ColorFilter? = null
+    val crop = RectF(0f, 0f, 1f, 1f)
+
+    private val density = resources.displayMetrics.density
+    private val hr = 13f * density
+    private val img = RectF()
+    private val bmpPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    private val dimPaint = Paint()
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val handleFill = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val handleRing = Paint(Paint.ANTI_ALIAS_FLAG)
+    private var active = -1
+
+    init {
+        dimPaint.color = Color.argb(150, 0, 0, 0)
+        linePaint.color = Color.parseColor("#4DA3FF")
+        linePaint.style = Paint.Style.STROKE
+        linePaint.strokeWidth = 2f * density
+        handleFill.color = Color.argb(200, 214, 238, 255)
+        handleRing.color = Color.parseColor("#4DA3FF")
+        handleRing.style = Paint.Style.STROKE
+        handleRing.strokeWidth = 2.5f * density
+    }
+
+    private fun computeImgRect(bm: Bitmap) {
+        val pad = hr + 6f * density
+        val aw = width - 2 * pad
+        val ah = height - 2 * pad
+        val s = minOf(aw / bm.width, ah / bm.height)
+        val w = bm.width * s
+        val h = bm.height * s
+        val cx = width / 2f
+        val cy = height / 2f
+        img.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
+    }
+
+    // order: 0 TL, 1 T, 2 TR, 3 R, 4 BR, 5 B, 6 BL, 7 L
+    private fun handlePoints(): FloatArray {
+        val l = img.left + crop.left * img.width()
+        val r = img.left + crop.right * img.width()
+        val t = img.top + crop.top * img.height()
+        val b = img.top + crop.bottom * img.height()
+        val mx = (l + r) / 2f
+        val my = (t + b) / 2f
+        return floatArrayOf(l, t, mx, t, r, t, r, my, r, b, mx, b, l, b, l, my)
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val bm = bitmap ?: return
+        computeImgRect(bm)
+        bmpPaint.colorFilter = filter
+        canvas.drawBitmap(bm, null, img, bmpPaint)
+
+        val l = img.left + crop.left * img.width()
+        val r = img.left + crop.right * img.width()
+        val t = img.top + crop.top * img.height()
+        val b = img.top + crop.bottom * img.height()
+        canvas.drawRect(img.left, img.top, img.right, t, dimPaint)
+        canvas.drawRect(img.left, b, img.right, img.bottom, dimPaint)
+        canvas.drawRect(img.left, t, l, b, dimPaint)
+        canvas.drawRect(r, t, img.right, b, dimPaint)
+        canvas.drawRect(l, t, r, b, linePaint)
+
+        val p = handlePoints()
+        for (k in 0 until 8) {
+            canvas.drawCircle(p[2 * k], p[2 * k + 1], hr, handleFill)
+            canvas.drawCircle(p[2 * k], p[2 * k + 1], hr, handleRing)
+        }
+    }
+
+    private fun hit(x: Float, y: Float): Int {
+        val p = handlePoints()
+        var best = -1
+        var bd = 44f * density
+        for (k in 0 until 8) {
+            val d = hypot(x - p[2 * k], y - p[2 * k + 1])
+            if (d < bd) {
+                bd = d
+                best = k
+            }
+        }
+        return best
+    }
+
+    private fun move(x: Float, y: Float) {
+        val nx = ((x - img.left) / img.width()).coerceIn(0f, 1f)
+        val ny = ((y - img.top) / img.height()).coerceIn(0f, 1f)
+        val m = 0.08f
+        if (active == 0 || active == 6 || active == 7) crop.left = minOf(nx, crop.right - m)
+        if (active == 2 || active == 3 || active == 4) crop.right = maxOf(nx, crop.left + m)
+        if (active == 0 || active == 1 || active == 2) crop.top = minOf(ny, crop.bottom - m)
+        if (active == 4 || active == 5 || active == 6) crop.bottom = maxOf(ny, crop.top + m)
+    }
+
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        val bm = bitmap ?: return false
+        computeImgRect(bm)
+        when (e.action) {
+            MotionEvent.ACTION_DOWN -> {
+                active = hit(e.x, e.y)
+                return active >= 0
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (active >= 0) {
+                    move(e.x, e.y)
+                    invalidate()
+                }
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> active = -1
+        }
+        return true
+    }
+
+    fun resetCrop() {
+        crop.set(0f, 0f, 1f, 1f)
+        invalidate()
+    }
+}
 
 class MainActivity : ComponentActivity() {
 
     private val DARK = Color.parseColor("#1C1C1C")
     private val GREEN = Color.parseColor("#2E9E5B")
+    private val BLUE_H = Color.parseColor("#4DA3FF")
     private val MATCH = LinearLayout.LayoutParams.MATCH_PARENT
     private val WRAP = LinearLayout.LayoutParams.WRAP_CONTENT
 
     private val pages = ArrayList<File>()
+    private val edited = ArrayList<File>()
+    private val cropRects = ArrayList<RectF>()
+    private val filterNames = listOf(
+        "Original", "Magic Color", "Magic White", "B&W", "Grayscale", "Lighten", "Vivid"
+    )
+    private val filterFrames = ArrayList<FrameLayout>()
+    private val filterLabels = ArrayList<TextView>()
+    private var filterIdx = 0
+    private var cropIndex = 0
+    private var cropView: CropView? = null
+    private var busy = false
+
     private var screen = "camera"
     private var pending = 0
     private var torchOn = false
@@ -102,6 +247,14 @@ class MainActivity : ComponentActivity() {
         return t
     }
 
+    private fun label(text: String, size: Float, color: Int): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.textSize = size
+        t.setTextColor(color)
+        return t
+    }
+
     private fun iconText(text: String, size: Float, onClick: () -> Unit): TextView {
         val t = TextView(this)
         t.text = text
@@ -109,6 +262,18 @@ class MainActivity : ComponentActivity() {
         t.setTextColor(Color.WHITE)
         t.gravity = Gravity.CENTER
         t.setPadding(dp(16), dp(10), dp(16), dp(10))
+        t.setOnClickListener { onClick() }
+        return t
+    }
+
+    private fun pill(text: String, color: Int, onClick: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.textSize = 16f
+        t.setTextColor(Color.WHITE)
+        t.setTypeface(null, Typeface.BOLD)
+        t.gravity = Gravity.CENTER
+        t.background = rounded(color, 28)
         t.setOnClickListener { onClick() }
         return t
     }
@@ -128,7 +293,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // photo/gallery image ko seedha karke (EXIF rotate) chhota JPEG bana deta hai
     private fun importFromUri(uri: Uri): File? {
         return try {
             val deg = try {
@@ -176,6 +340,79 @@ class MainActivity : ComponentActivity() {
         } catch (e: Throwable) {
             null
         }
+    }
+
+    // ---------- filters ----------
+
+    private fun contrastMatrix(c: Float, brightness: Float): ColorMatrix {
+        val t = (-0.5f * c + 0.5f) * 255f + brightness
+        return ColorMatrix(
+            floatArrayOf(
+                c, 0f, 0f, 0f, t,
+                0f, c, 0f, 0f, t,
+                0f, 0f, c, 0f, t,
+                0f, 0f, 0f, 1f, 0f
+            )
+        )
+    }
+
+    private fun filterMatrix(i: Int): ColorMatrix? {
+        return when (i) {
+            1 -> {
+                val m = ColorMatrix()
+                m.setSaturation(1.2f)
+                m.postConcat(contrastMatrix(1.3f, 12f))
+                m
+            }
+            2 -> {
+                val m = ColorMatrix()
+                m.setSaturation(0.25f)
+                m.postConcat(contrastMatrix(1.8f, 45f))
+                m
+            }
+            3 -> {
+                val m = ColorMatrix()
+                m.setSaturation(0f)
+                m.postConcat(contrastMatrix(2.8f, 25f))
+                m
+            }
+            4 -> {
+                val m = ColorMatrix()
+                m.setSaturation(0f)
+                m
+            }
+            5 -> contrastMatrix(1.1f, 45f)
+            6 -> {
+                val m = ColorMatrix()
+                m.setSaturation(1.8f)
+                m.postConcat(contrastMatrix(1.15f, 0f))
+                m
+            }
+            else -> null
+        }
+    }
+
+    private fun filterFilter(i: Int): ColorFilter? {
+        val m = filterMatrix(i) ?: return null
+        return ColorMatrixColorFilter(m)
+    }
+
+    private fun applyEdit(src: File, rect: RectF, fi: Int, dst: File) {
+        val bmp = BitmapFactory.decodeFile(src.absolutePath)
+            ?: throw IllegalStateException("Image load nahi hui")
+        val x = (rect.left * bmp.width).toInt().coerceIn(0, bmp.width - 1)
+        val y = (rect.top * bmp.height).toInt().coerceIn(0, bmp.height - 1)
+        val w = ((rect.right - rect.left) * bmp.width).toInt().coerceIn(1, bmp.width - x)
+        val h = ((rect.bottom - rect.top) * bmp.height).toInt().coerceIn(1, bmp.height - y)
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        val cf = filterFilter(fi)
+        if (cf != null) paint.colorFilter = cf
+        canvas.drawBitmap(bmp, Rect(x, y, x + w, y + h), Rect(0, 0, w, h), paint)
+        FileOutputStream(dst).use { out.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+        bmp.recycle()
+        out.recycle()
     }
 
     // ---------- camera ----------
@@ -301,7 +538,152 @@ class MainActivity : ComponentActivity() {
             toast("Pehle kam se kam 1 page capture karo")
             return
         }
-        showNext()
+        cropRects.clear()
+        for (p in pages) cropRects.add(RectF(0f, 0f, 1f, 1f))
+        filterIdx = 0
+        showCrop(0)
+    }
+
+    // ---------- crop + filters ----------
+
+    private fun updateFilterSelection() {
+        for (i in filterFrames.indices) {
+            val d = GradientDrawable()
+            d.cornerRadius = dp(10).toFloat()
+            d.setColor(Color.parseColor("#2A2A2A"))
+            if (i == filterIdx) d.setStroke(dp(3), BLUE_H)
+            filterFrames[i].background = d
+            filterLabels[i].setTextColor(
+                if (i == filterIdx) Color.WHITE else Color.parseColor("#9E9E9E")
+            )
+        }
+    }
+
+    private fun selectFilter(i: Int) {
+        filterIdx = i
+        cropView?.filter = filterFilter(i)
+        cropView?.invalidate()
+        updateFilterSelection()
+    }
+
+    private fun buildFilterStrip(tb: Bitmap?): View {
+        filterFrames.clear()
+        filterLabels.clear()
+        val hs = HorizontalScrollView(this)
+        hs.isHorizontalScrollBarEnabled = false
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        row.setPadding(dp(10), dp(8), dp(10), dp(8))
+        for (i in filterNames.indices) {
+            val item = LinearLayout(this)
+            item.orientation = LinearLayout.VERTICAL
+            item.gravity = Gravity.CENTER_HORIZONTAL
+            val frame = FrameLayout(this)
+            frame.setPadding(dp(3), dp(3), dp(3), dp(3))
+            val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.CENTER_CROP
+            if (tb != null) iv.setImageBitmap(tb)
+            val cf = filterFilter(i)
+            if (cf != null) iv.setColorFilter(cf)
+            frame.addView(iv, FrameLayout.LayoutParams(dp(64), dp(64)))
+            item.addView(frame, lp(WRAP, WRAP))
+            val lb = label(filterNames[i], 11f, Color.parseColor("#9E9E9E"))
+            lb.setPadding(0, dp(4), 0, 0)
+            item.addView(lb, lp(WRAP, WRAP))
+            item.setOnClickListener { selectFilter(i) }
+            row.addView(item, lp(dp(84), WRAP))
+            filterFrames.add(frame)
+            filterLabels.add(lb)
+        }
+        hs.addView(row)
+        updateFilterSelection()
+        return hs
+    }
+
+    private fun showCrop(i: Int) {
+        screen = "crop"
+        cropIndex = i
+        stopCamera()
+        val n = pages.size
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(Color.parseColor("#121212"))
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.VERTICAL
+        head.gravity = Gravity.CENTER_HORIZONTAL
+        head.setPadding(0, dp(28), 0, dp(8))
+        head.addView(label("Crop", 22f, Color.WHITE))
+        head.addView(label("Page ${i + 1} of $n", 14f, Color.parseColor("#9E9E9E")))
+        root.addView(head, lp(MATCH, WRAP))
+
+        val cv = CropView(this)
+        cv.bitmap = thumb(pages[i], 1600)
+        cv.crop.set(cropRects[i])
+        cv.filter = filterFilter(filterIdx)
+        cropView = cv
+        root.addView(cv, lp(MATCH, 0, 1f))
+
+        root.addView(buildFilterStrip(thumb(pages[i], 160)), lp(MATCH, dp(118)))
+
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.setPadding(dp(16), dp(8), dp(16), dp(20))
+        bar.addView(pill("Back", Color.parseColor("#3A3A3A")) { cropBack() }, lp(dp(96), dp(52)))
+        bar.addView(View(this), lp(0, 1, 1f))
+        val reset = iconText("Reset crop", 15f) { cropView?.resetCrop() }
+        bar.addView(reset, lp(WRAP, WRAP))
+        bar.addView(View(this), lp(0, 1, 1f))
+        bar.addView(pill("Next", GREEN) { cropNext() }, lp(dp(110), dp(56)))
+        root.addView(bar)
+        setContentView(root)
+    }
+
+    private fun cropNext() {
+        if (busy) return
+        cropView?.let { cropRects[cropIndex].set(it.crop) }
+        if (cropIndex < pages.size - 1) showCrop(cropIndex + 1) else applyAll()
+    }
+
+    private fun cropBack() {
+        if (busy) return
+        cropView?.let { cropRects[cropIndex].set(it.crop) }
+        if (cropIndex > 0) showCrop(cropIndex - 1) else showCamera()
+    }
+
+    private fun applyAll() {
+        if (busy) return
+        busy = true
+        toast("Processing...")
+        val srcs = pages.toList()
+        val rects = cropRects.map { RectF(it) }
+        val fi = filterIdx
+        worker.execute {
+            val out = ArrayList<File>()
+            var err: Throwable? = null
+            try {
+                for (k in srcs.indices) {
+                    val dst = File(pagesDir(), "e_${System.nanoTime()}.jpg")
+                    applyEdit(srcs[k], rects[k], fi, dst)
+                    out.add(dst)
+                }
+            } catch (e: Throwable) {
+                err = e
+            }
+            runOnUiThread {
+                busy = false
+                if (err != null) {
+                    for (f in out) f.delete()
+                    toast("Process error: $err")
+                } else {
+                    for (f in edited) f.delete()
+                    edited.clear()
+                    edited.addAll(out)
+                    showNext()
+                }
+            }
+        }
     }
 
     // ---------- screens ----------
@@ -312,7 +694,6 @@ class MainActivity : ComponentActivity() {
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(DARK)
 
-        // top bar: close (left) + flash (right)
         val top = FrameLayout(this)
         top.setPadding(dp(8), dp(24), dp(8), dp(4))
         top.addView(
@@ -328,7 +709,6 @@ class MainActivity : ComponentActivity() {
         )
         root.addView(top, lp(MATCH, dp(76)))
 
-        // preview + thumbnail overlay
         val container = FrameLayout(this)
         val pv = PreviewView(this)
         pv.scaleType = PreviewView.ScaleType.FIT_CENTER
@@ -360,7 +740,6 @@ class MainActivity : ComponentActivity() {
         container.addView(tb, tlp)
         root.addView(container, lp(MATCH, 0, 1f))
 
-        // bottom bar: gallery | capture | proceed
         val bar = LinearLayout(this)
         bar.orientation = LinearLayout.HORIZONTAL
         bar.gravity = Gravity.CENTER_VERTICAL
@@ -416,24 +795,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Stage 1 ka placeholder: Stage 2 mein yahan Crop + Filters aayenge
+    // Stage 2 ka end screen: Stage 3 mein yahan Rotate + Crop review aayega
     private fun showNext() {
         screen = "next"
-        stopCamera()
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(Color.parseColor("#F3F9FF"))
         root.setPadding(dp(24), dp(60), dp(24), dp(24))
 
         val t = TextView(this)
-        t.text = "Stage 1 pass"
+        t.text = "Stage 2 pass"
         t.textSize = 26f
         t.setTypeface(null, Typeface.BOLD)
         t.setTextColor(Color.parseColor("#01579B"))
         root.addView(t)
 
         val c = TextView(this)
-        c.text = "${pages.size} page(s) ready. Crop aur Filters agle stage mein aayenge."
+        c.text = "${edited.size} page(s) crop + filter ke saath tayyar hain. Rotate aur review agle stage mein aayega."
         c.textSize = 15f
         c.setTextColor(Color.parseColor("#455A64"))
         c.setPadding(0, dp(8), 0, dp(16))
@@ -442,7 +820,7 @@ class MainActivity : ComponentActivity() {
         val hs = HorizontalScrollView(this)
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
-        for (p in pages) {
+        for (p in edited) {
             val iv = ImageView(this)
             iv.scaleType = ImageView.ScaleType.CENTER_CROP
             iv.setImageBitmap(thumb(p, 300))
@@ -454,12 +832,12 @@ class MainActivity : ComponentActivity() {
         root.addView(hs)
 
         val back = TextView(this)
-        back.text = "Camera par wapas"
+        back.text = "Back (Crop par)"
         back.textSize = 16f
         back.setTextColor(Color.WHITE)
         back.gravity = Gravity.CENTER
         back.background = rounded(Color.parseColor("#0288D1"), 14)
-        back.setOnClickListener { showCamera() }
+        back.setOnClickListener { showCrop(0) }
         val bl = lp(MATCH, dp(56))
         bl.topMargin = dp(24)
         root.addView(back, bl)
@@ -481,7 +859,12 @@ class MainActivity : ComponentActivity() {
         pagesDir().listFiles()?.forEach { it.delete() }
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (screen == "camera") finish() else showCamera()
+                when (screen) {
+                    "camera" -> finish()
+                    "crop" -> cropBack()
+                    "next" -> showCrop(0)
+                    else -> showCamera()
+                }
             }
         })
         try {
