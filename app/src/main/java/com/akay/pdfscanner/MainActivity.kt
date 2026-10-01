@@ -1,7 +1,9 @@
 package com.akay.pdfscanner
 
 import android.Manifest
+import android.content.ContentValues
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -19,9 +21,12 @@ import android.graphics.drawable.GradientDrawable
 import android.media.ExifInterface
 import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
 import android.widget.ImageView
@@ -40,10 +45,66 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.Executors
 import kotlin.math.hypot
+
+// ---------- PDF writer: JPEG seedha PDF mein (chhoti file) ----------
+fun buildPdf(files: List<File>, out: OutputStream) {
+    val offsets = ArrayList<Long>()
+    var pos = 0L
+    fun w(s: String) {
+        val b = s.toByteArray(Charsets.ISO_8859_1)
+        out.write(b)
+        pos += b.size
+    }
+    fun wb(b: ByteArray) {
+        out.write(b)
+        pos += b.size
+    }
+    val n = files.size
+    w("%PDF-1.4\n")
+    offsets.add(pos)
+    w("1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n")
+    offsets.add(pos)
+    val kids = (0 until n).joinToString(" ") { "${3 + 3 * it} 0 R" }
+    w("2 0 obj\n<< /Type /Pages /Kids [$kids] /Count $n >>\nendobj\n")
+    for (i in 0 until n) {
+        val opts = BitmapFactory.Options()
+        opts.inJustDecodeBounds = true
+        BitmapFactory.decodeFile(files[i].absolutePath, opts)
+        val iw = opts.outWidth
+        val ih = opts.outHeight
+        if (iw <= 0 || ih <= 0) throw IllegalStateException("Bad image")
+        val pw = 595f
+        val ph = pw * ih / iw
+        val jpg = files[i].readBytes()
+        val po = 3 + 3 * i
+        offsets.add(pos)
+        w("$po 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 $pw $ph] /Resources << /XObject << /Im0 ${po + 2} 0 R >> >> /Contents ${po + 1} 0 R >>\nendobj\n")
+        val content = "q $pw 0 0 $ph 0 0 cm /Im0 Do Q"
+        offsets.add(pos)
+        w("${po + 1} 0 obj\n<< /Length ${content.length} >>\nstream\n$content\nendstream\nendobj\n")
+        offsets.add(pos)
+        w("${po + 2} 0 obj\n<< /Type /XObject /Subtype /Image /Width $iw /Height $ih /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpg.size} >>\nstream\n")
+        wb(jpg)
+        w("\nendstream\nendobj\n")
+    }
+    val xrefPos = pos
+    w("xref\n0 ${offsets.size + 1}\n")
+    w("0000000000 65535 f \n")
+    for (o in offsets) {
+        w(String.format(Locale.US, "%010d 00000 n \n", o))
+    }
+    w("trailer\n<< /Size ${offsets.size + 1} /Root 1 0 R >>\nstartxref\n$xrefPos\n%%EOF\n")
+    out.flush()
+}
 
 // ---------- Crop view: 8 blue handles ----------
 class CropView(context: Context) : View(context) {
@@ -169,8 +230,10 @@ class CropView(context: Context) : View(context) {
 
 class MainActivity : ComponentActivity() {
 
+    private val AUTH = "com.akay.pdfscanner.fileprovider"
     private val DARK = Color.parseColor("#1C1C1C")
     private val GREEN = Color.parseColor("#2E9E5B")
+    private val BLUE = Color.parseColor("#0288D1")
     private val BLUE_H = Color.parseColor("#4DA3FF")
     private val MATCH = LinearLayout.LayoutParams.MATCH_PARENT
     private val WRAP = LinearLayout.LayoutParams.WRAP_CONTENT
@@ -188,6 +251,11 @@ class MainActivity : ComponentActivity() {
     private var editIndex = 0
     private var cropView: CropView? = null
     private var busy = false
+
+    private var scanName = ""
+    private var fmt = "pdf"
+    private var nameInput: EditText? = null
+    private var statusView: TextView? = null
 
     private var screen = "camera"
     private var pending = 0
@@ -220,6 +288,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
+
+    private fun stamp(): String =
+        SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
 
     private fun lp(w: Int, h: Int, weight: Float = 0f): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(w, h, weight)
@@ -298,6 +369,27 @@ class MainActivity : ComponentActivity() {
         t.setTextColor(Color.WHITE)
         t.gravity = Gravity.CENTER
         t.background = oval(Color.argb(150, 0, 0, 0))
+        t.setOnClickListener { onClick() }
+        return t
+    }
+
+    private fun chip(text: String, selected: Boolean, onClick: () -> Unit): TextView {
+        val t = TextView(this)
+        t.text = text
+        t.textSize = 15f
+        t.gravity = Gravity.CENTER
+        t.setTypeface(null, Typeface.BOLD)
+        val d = GradientDrawable()
+        d.cornerRadius = dp(14).toFloat()
+        if (selected) {
+            d.setColor(BLUE)
+            t.setTextColor(Color.WHITE)
+        } else {
+            d.setColor(Color.WHITE)
+            d.setStroke(dp(2), BLUE)
+            t.setTextColor(BLUE)
+        }
+        t.background = d
         t.setOnClickListener { onClick() }
         return t
     }
@@ -710,7 +802,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ---------- Stage 3: rotate / re-crop / delete ----------
+    // ---------- rotate / re-crop / delete ----------
 
     private fun showEdit(i: Int) {
         screen = "edit"
@@ -888,6 +980,280 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ---------- Stage 4: naam, PDF/JPG, Share, Download ----------
+
+    private fun baseName(): String {
+        var n = (nameInput?.text?.toString() ?: scanName).trim()
+        n = n.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        n = n.removeSuffix(".pdf").removeSuffix(".PDF").removeSuffix(".jpg").removeSuffix(".JPG")
+        if (n.isEmpty()) n = "Scan_" + stamp()
+        return n
+    }
+
+    private fun jpgName(base: String, k: Int, total: Int): String =
+        if (total == 1) "$base.jpg" else "${base}_${k + 1}.jpg"
+
+    private fun setStatus(s: String) {
+        statusView?.text = s
+    }
+
+    private fun resetAll() {
+        for (f in pages) f.delete()
+        for (f in edited) f.delete()
+        pages.clear()
+        edited.clear()
+        cropRects.clear()
+        filterIdx = 0
+        scanName = ""
+        fmt = "pdf"
+        File(cacheDir, "share").deleteRecursively()
+    }
+
+    private fun showNext() {
+        screen = "next"
+        if (scanName.isEmpty()) scanName = "Scan_" + stamp()
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(Color.parseColor("#F3F9FF"))
+
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.VERTICAL
+        head.setBackgroundColor(BLUE)
+        head.setPadding(dp(24), dp(40), dp(24), dp(18))
+        head.addView(label("PDF taiyar hai", 24f, Color.WHITE))
+        head.addView(label("${edited.size} page(s)", 14f, Color.parseColor("#D6EEFF")))
+        root.addView(head, lp(MATCH, WRAP))
+
+        val body = LinearLayout(this)
+        body.orientation = LinearLayout.VERTICAL
+        body.setPadding(dp(20), dp(16), dp(20), dp(16))
+
+        val hs = HorizontalScrollView(this)
+        hs.isHorizontalScrollBarEnabled = false
+        val row = LinearLayout(this)
+        row.orientation = LinearLayout.HORIZONTAL
+        for (p in edited) {
+            val iv = ImageView(this)
+            iv.scaleType = ImageView.ScaleType.CENTER_CROP
+            iv.setPadding(dp(2), dp(2), dp(2), dp(2))
+            iv.background = rounded(Color.WHITE, 8)
+            iv.setImageBitmap(thumb(p, 300))
+            val l = lp(dp(96), dp(132))
+            l.rightMargin = dp(8)
+            row.addView(iv, l)
+        }
+        hs.addView(row)
+        body.addView(hs)
+
+        val nl = label("File ka naam", 13f, Color.parseColor("#455A64"))
+        nl.setPadding(0, dp(18), 0, dp(6))
+        body.addView(nl)
+
+        val et = EditText(this)
+        et.setText(scanName)
+        et.setSingleLine(true)
+        et.textSize = 16f
+        et.setTextColor(Color.parseColor("#01579B"))
+        et.setPadding(dp(14), dp(12), dp(14), dp(12))
+        et.background = rounded(Color.WHITE, 12)
+        nameInput = et
+        body.addView(et, lp(MATCH, WRAP))
+
+        val fl = label("Format chuno", 13f, Color.parseColor("#455A64"))
+        fl.setPadding(0, dp(18), 0, dp(6))
+        body.addView(fl)
+
+        val chips = LinearLayout(this)
+        chips.orientation = LinearLayout.HORIZONTAL
+        val c1 = lp(0, dp(48), 1f)
+        c1.rightMargin = dp(6)
+        val c2 = lp(0, dp(48), 1f)
+        c2.leftMargin = dp(6)
+        chips.addView(chip("Save as PDF", fmt == "pdf") {
+            scanName = baseName()
+            fmt = "pdf"
+            showNext()
+        }, c1)
+        chips.addView(chip("Save as JPG", fmt == "jpg") {
+            scanName = baseName()
+            fmt = "jpg"
+            showNext()
+        }, c2)
+        body.addView(chips, lp(MATCH, WRAP))
+
+        val acts = LinearLayout(this)
+        acts.orientation = LinearLayout.HORIZONTAL
+        val share = TextView(this)
+        share.text = "Share"
+        share.textSize = 17f
+        share.setTextColor(BLUE)
+        share.setTypeface(null, Typeface.BOLD)
+        share.gravity = Gravity.CENTER
+        val sd = GradientDrawable()
+        sd.cornerRadius = dp(28).toFloat()
+        sd.setColor(Color.WHITE)
+        sd.setStroke(dp(2), BLUE)
+        share.background = sd
+        share.setOnClickListener { doShare() }
+        val a1 = lp(0, dp(58), 1f)
+        a1.rightMargin = dp(6)
+        acts.addView(share, a1)
+        val a2 = lp(0, dp(58), 1f)
+        a2.leftMargin = dp(6)
+        acts.addView(pill("Download", GREEN) { doDownload() }, a2)
+        val alp = lp(MATCH, WRAP)
+        alp.topMargin = dp(20)
+        body.addView(acts, alp)
+
+        val st = label("Download dabane par hi phone mein save hoga.", 13f, Color.parseColor("#455A64"))
+        st.setPadding(0, dp(14), 0, 0)
+        statusView = st
+        body.addView(st)
+
+        val sv = ScrollView(this)
+        sv.addView(body)
+        root.addView(sv, lp(MATCH, 0, 1f))
+
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.setPadding(dp(16), dp(8), dp(16), dp(20))
+        bar.addView(pill("Back", Color.parseColor("#78909C")) { leaveFinal() }, lp(dp(96), dp(52)))
+        bar.addView(View(this), lp(0, 1, 1f))
+        bar.addView(pill("Done", BLUE) {
+            resetAll()
+            showCamera()
+        }, lp(dp(110), dp(52)))
+        root.addView(bar)
+        setContentView(root)
+    }
+
+    private fun leaveFinal() {
+        scanName = baseName()
+        showEdit(0)
+    }
+
+    private fun doShare() {
+        if (busy) return
+        busy = true
+        val base = baseName()
+        scanName = base
+        val files = edited.toList()
+        val asPdf = fmt == "pdf"
+        setStatus("Share ke liye taiyar ho raha hai...")
+        worker.execute {
+            var uris: ArrayList<Uri>? = null
+            var err: Throwable? = null
+            try {
+                val dir = File(cacheDir, "share")
+                dir.deleteRecursively()
+                dir.mkdirs()
+                val list = ArrayList<Uri>()
+                if (asPdf) {
+                    val f = File(dir, "$base.pdf")
+                    FileOutputStream(f).buffered().use { buildPdf(files, it) }
+                    list.add(FileProvider.getUriForFile(this, AUTH, f))
+                } else {
+                    for (k in files.indices) {
+                        val f = File(dir, jpgName(base, k, files.size))
+                        files[k].copyTo(f, true)
+                        list.add(FileProvider.getUriForFile(this, AUTH, f))
+                    }
+                }
+                uris = list
+            } catch (e: Throwable) {
+                err = e
+            }
+            val res = uris
+            val er = err
+            runOnUiThread {
+                busy = false
+                if (er != null || res == null) {
+                    setStatus("Share error: $er")
+                    toast("Share error: $er")
+                } else {
+                    setStatus("")
+                    try {
+                        val i: Intent
+                        if (res.size == 1) {
+                            i = Intent(Intent.ACTION_SEND)
+                            i.putExtra(Intent.EXTRA_STREAM, res[0])
+                        } else {
+                            i = Intent(Intent.ACTION_SEND_MULTIPLE)
+                            i.putParcelableArrayListExtra(Intent.EXTRA_STREAM, res)
+                        }
+                        i.type = if (asPdf) "application/pdf" else "image/*"
+                        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        startActivity(Intent.createChooser(i, "Share"))
+                    } catch (e: Throwable) {
+                        toast("Share error: $e")
+                    }
+                }
+            }
+        }
+    }
+
+    private fun doDownload() {
+        if (busy) return
+        busy = true
+        val base = baseName()
+        scanName = base
+        val files = edited.toList()
+        val asPdf = fmt == "pdf"
+        setStatus("Save ho raha hai...")
+        worker.execute {
+            var msg = ""
+            var err: Throwable? = null
+            try {
+                if (asPdf) {
+                    val values = ContentValues()
+                    values.put(MediaStore.Downloads.DISPLAY_NAME, "$base.pdf")
+                    values.put(MediaStore.Downloads.MIME_TYPE, "application/pdf")
+                    values.put(
+                        MediaStore.Downloads.RELATIVE_PATH,
+                        Environment.DIRECTORY_DOWNLOADS + "/PDFScanner"
+                    )
+                    val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                        ?: throw IllegalStateException("File nahi ban payi")
+                    val os = contentResolver.openOutputStream(uri)
+                        ?: throw IllegalStateException("File nahi khul payi")
+                    os.buffered().use { buildPdf(files, it) }
+                    msg = "PDF save ho gayi: Downloads/PDFScanner/$base.pdf"
+                } else {
+                    for (k in files.indices) {
+                        val values = ContentValues()
+                        values.put(MediaStore.Images.Media.DISPLAY_NAME, jpgName(base, k, files.size))
+                        values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                        values.put(
+                            MediaStore.Images.Media.RELATIVE_PATH,
+                            Environment.DIRECTORY_PICTURES + "/PDFScanner"
+                        )
+                        val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+                            ?: throw IllegalStateException("File nahi ban payi")
+                        val os = contentResolver.openOutputStream(uri)
+                            ?: throw IllegalStateException("File nahi khul payi")
+                        os.use { out -> files[k].inputStream().use { it.copyTo(out) } }
+                    }
+                    msg = "JPG save ho gayi: Pictures/PDFScanner"
+                }
+            } catch (e: Throwable) {
+                err = e
+            }
+            val er = err
+            val ok = msg
+            runOnUiThread {
+                busy = false
+                if (er != null) {
+                    setStatus("Save error: $er")
+                    toast("Save error: $er")
+                } else {
+                    setStatus(ok)
+                    toast(ok)
+                }
+            }
+        }
+    }
+
     // ---------- screens ----------
 
     private fun showCamera() {
@@ -997,55 +1363,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Stage 3 ka end screen: Stage 4 mein yahan naam, Save PDF/JPG, Share, Download aayenge
-    private fun showNext() {
-        screen = "next"
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#F3F9FF"))
-        root.setPadding(dp(24), dp(60), dp(24), dp(24))
-
-        val t = TextView(this)
-        t.text = "Stage 3 pass"
-        t.textSize = 26f
-        t.setTypeface(null, Typeface.BOLD)
-        t.setTextColor(Color.parseColor("#01579B"))
-        root.addView(t)
-
-        val c = TextView(this)
-        c.text = "${edited.size} page(s) tayyar hain. Naam, Save PDF/JPG, Share aur Download agle stage mein aayenge."
-        c.textSize = 15f
-        c.setTextColor(Color.parseColor("#455A64"))
-        c.setPadding(0, dp(8), 0, dp(16))
-        root.addView(c)
-
-        val hs = HorizontalScrollView(this)
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        for (p in edited) {
-            val iv = ImageView(this)
-            iv.scaleType = ImageView.ScaleType.CENTER_CROP
-            iv.setImageBitmap(thumb(p, 300))
-            val l = lp(dp(100), dp(140))
-            l.rightMargin = dp(8)
-            row.addView(iv, l)
-        }
-        hs.addView(row)
-        root.addView(hs)
-
-        val back = TextView(this)
-        back.text = "Back (Edit par)"
-        back.textSize = 16f
-        back.setTextColor(Color.WHITE)
-        back.gravity = Gravity.CENTER
-        back.background = rounded(Color.parseColor("#0288D1"), 14)
-        back.setOnClickListener { showEdit(0) }
-        val bl = lp(MATCH, dp(56))
-        bl.topMargin = dp(24)
-        root.addView(back, bl)
-        setContentView(root)
-    }
-
     private fun showError(e: Throwable) {
         val tv = TextView(this)
         tv.text = "ERROR (screenshot bhejo):\n\n" + android.util.Log.getStackTraceString(e)
@@ -1059,6 +1376,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         pagesDir().listFiles()?.forEach { it.delete() }
+        File(cacheDir, "share").deleteRecursively()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
                 when (screen) {
@@ -1066,7 +1384,7 @@ class MainActivity : ComponentActivity() {
                     "crop" -> cropBack()
                     "edit" -> showCrop(0)
                     "recrop" -> showEdit(editIndex)
-                    "next" -> showEdit(0)
+                    "next" -> leaveFinal()
                     else -> showCamera()
                 }
             }
