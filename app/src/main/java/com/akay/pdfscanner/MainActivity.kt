@@ -1,6 +1,7 @@
 package com.akay.pdfscanner
 
 import android.Manifest
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -14,6 +15,7 @@ import android.graphics.ColorMatrix
 import android.graphics.ColorMatrixColorFilter
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.Typeface
@@ -53,7 +55,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.sin
 
 // ---------- PDF writer: JPEG seedha PDF mein (chhoti file) ----------
 fun buildPdf(files: List<File>, out: OutputStream) {
@@ -110,6 +114,7 @@ fun buildPdf(files: List<File>, out: OutputStream) {
 class CropView(context: Context) : View(context) {
     var bitmap: Bitmap? = null
     var filter: ColorFilter? = null
+    var bottomReserve = 0f
     val crop = RectF(0f, 0f, 1f, 1f)
 
     private val density = resources.displayMetrics.density
@@ -136,12 +141,12 @@ class CropView(context: Context) : View(context) {
     private fun computeImgRect(bm: Bitmap) {
         val pad = hr + 6f * density
         val aw = width - 2 * pad
-        val ah = height - 2 * pad
+        val ah = height - 2 * pad - bottomReserve
         val s = minOf(aw / bm.width, ah / bm.height)
         val w = bm.width * s
         val h = bm.height * s
         val cx = width / 2f
-        val cy = height / 2f
+        val cy = (height - bottomReserve) / 2f
         img.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
     }
 
@@ -228,6 +233,87 @@ class CropView(context: Context) : View(context) {
     }
 }
 
+// ---------- Transparent round icons: 0 = bin, 1 = crop, 2 = rotate ----------
+class IconView(context: Context, private val kind: Int) : View(context) {
+    private val d = resources.displayMetrics.density
+    private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val line = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val solid = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val path = Path()
+
+    init {
+        bg.color = Color.argb(115, 0, 0, 0)
+        line.color = Color.argb(240, 255, 255, 255)
+        line.style = Paint.Style.STROKE
+        line.strokeWidth = 2.2f * d
+        line.strokeCap = Paint.Cap.ROUND
+        line.strokeJoin = Paint.Join.ROUND
+        solid.color = line.color
+        solid.style = Paint.Style.FILL
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val s = minOf(width, height).toFloat()
+        val ox = (width - s) / 2f
+        val oy = (height - s) / 2f
+        canvas.drawCircle(width / 2f, height / 2f, s / 2f, bg)
+        fun fx(f: Float): Float = ox + f * s
+        fun fy(f: Float): Float = oy + f * s
+        when (kind) {
+            0 -> {
+                canvas.drawLine(fx(0.28f), fy(0.33f), fx(0.72f), fy(0.33f), line)
+                path.reset()
+                path.moveTo(fx(0.42f), fy(0.33f))
+                path.lineTo(fx(0.42f), fy(0.26f))
+                path.lineTo(fx(0.58f), fy(0.26f))
+                path.lineTo(fx(0.58f), fy(0.33f))
+                canvas.drawPath(path, line)
+                path.reset()
+                path.moveTo(fx(0.33f), fy(0.39f))
+                path.lineTo(fx(0.37f), fy(0.74f))
+                path.lineTo(fx(0.63f), fy(0.74f))
+                path.lineTo(fx(0.67f), fy(0.39f))
+                canvas.drawPath(path, line)
+                canvas.drawLine(fx(0.46f), fy(0.47f), fx(0.46f), fy(0.66f), line)
+                canvas.drawLine(fx(0.54f), fy(0.47f), fx(0.54f), fy(0.66f), line)
+            }
+            1 -> {
+                path.reset()
+                path.moveTo(fx(0.30f), fy(0.14f))
+                path.lineTo(fx(0.30f), fy(0.70f))
+                path.lineTo(fx(0.86f), fy(0.70f))
+                canvas.drawPath(path, line)
+                path.reset()
+                path.moveTo(fx(0.14f), fy(0.30f))
+                path.lineTo(fx(0.70f), fy(0.30f))
+                path.lineTo(fx(0.70f), fy(0.86f))
+                canvas.drawPath(path, line)
+            }
+            else -> {
+                val r = 0.26f * s
+                val cx = fx(0.5f)
+                val cy = fy(0.5f)
+                canvas.drawArc(RectF(cx - r, cy - r, cx + r, cy + r), -70f, 290f, false, line)
+                val a = Math.toRadians(220.0)
+                val px = cx + r * cos(a).toFloat()
+                val py = cy + r * sin(a).toFloat()
+                val dx = (-sin(a)).toFloat()
+                val dy = cos(a).toFloat()
+                val nx = -dy
+                val ny = dx
+                val hl = 0.14f * s
+                val hw = 0.09f * s
+                path.reset()
+                path.moveTo(px + dx * hl, py + dy * hl)
+                path.lineTo(px + nx * hw, py + ny * hw)
+                path.lineTo(px - nx * hw, py - ny * hw)
+                path.close()
+                canvas.drawPath(path, solid)
+            }
+        }
+    }
+}
+
 class MainActivity : ComponentActivity() {
 
     private val AUTH = "com.akay.pdfscanner.fileprovider"
@@ -253,7 +339,6 @@ class MainActivity : ComponentActivity() {
     private var busy = false
 
     private var scanName = ""
-    private var fmt = "pdf"
     private var nameInput: EditText? = null
     private var statusView: TextView? = null
 
@@ -369,27 +454,6 @@ class MainActivity : ComponentActivity() {
         t.setTextColor(Color.WHITE)
         t.gravity = Gravity.CENTER
         t.background = oval(Color.argb(150, 0, 0, 0))
-        t.setOnClickListener { onClick() }
-        return t
-    }
-
-    private fun chip(text: String, selected: Boolean, onClick: () -> Unit): TextView {
-        val t = TextView(this)
-        t.text = text
-        t.textSize = 15f
-        t.gravity = Gravity.CENTER
-        t.setTypeface(null, Typeface.BOLD)
-        val d = GradientDrawable()
-        d.cornerRadius = dp(14).toFloat()
-        if (selected) {
-            d.setColor(BLUE)
-            t.setTextColor(Color.WHITE)
-        } else {
-            d.setColor(Color.WHITE)
-            d.setStroke(dp(2), BLUE)
-            t.setTextColor(BLUE)
-        }
-        t.background = d
         t.setOnClickListener { onClick() }
         return t
     }
@@ -660,7 +724,7 @@ class MainActivity : ComponentActivity() {
         showCrop(0)
     }
 
-    // ---------- crop + filters ----------
+    // ---------- crop + filters (Stage 2) ----------
 
     private fun updateFilterSelection() {
         for (i in filterFrames.indices) {
@@ -734,11 +798,34 @@ class MainActivity : ComponentActivity() {
         root.addView(head, lp(MATCH, WRAP))
 
         val cv = CropView(this)
+        cv.bottomReserve = 60f * resources.displayMetrics.density
         cv.bitmap = thumb(pages[i], 1600)
         cv.crop.set(cropRects[i])
         cv.filter = filterFilter(filterIdx)
         cropView = cv
-        root.addView(cv, lp(MATCH, 0, 1f))
+
+        val area = FrameLayout(this)
+        area.addView(cv, FrameLayout.LayoutParams(MATCH, MATCH))
+
+        val icons = LinearLayout(this)
+        icons.orientation = LinearLayout.HORIZONTAL
+        icons.gravity = Gravity.CENTER_VERTICAL
+        icons.setPadding(dp(18), 0, dp(18), dp(8))
+        val binIcon = IconView(this, 0)
+        binIcon.setOnClickListener { deleteInCrop(i) }
+        icons.addView(binIcon, lp(dp(46), dp(46)))
+        icons.addView(View(this), lp(0, 1, 1f))
+        val cropIcon = IconView(this, 1)
+        cropIcon.setOnClickListener { applyCropNow(i) }
+        val cl = lp(dp(46), dp(46))
+        cl.rightMargin = dp(14)
+        icons.addView(cropIcon, cl)
+        val rotIcon = IconView(this, 2)
+        rotIcon.setOnClickListener { rotateInCrop(i) }
+        icons.addView(rotIcon, lp(dp(46), dp(46)))
+        area.addView(icons, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
+
+        root.addView(area, lp(MATCH, 0, 1f))
 
         root.addView(buildFilterStrip(thumb(pages[i], 160)), lp(MATCH, dp(118)))
 
@@ -754,6 +841,82 @@ class MainActivity : ComponentActivity() {
         bar.addView(pill("Next", GREEN) { cropNext() }, lp(dp(110), dp(56)))
         root.addView(bar)
         setContentView(root)
+    }
+
+    private fun deleteInCrop(i: Int) {
+        if (busy) return
+        pages[i].delete()
+        pages.removeAt(i)
+        if (i < cropRects.size) cropRects.removeAt(i)
+        toast("Page deleted")
+        if (pages.isEmpty()) showCamera() else showCrop(minOf(i, pages.size - 1))
+    }
+
+    private fun rotateInCrop(i: Int) {
+        if (busy) return
+        val cv = cropView ?: return
+        val c = RectF(cv.crop)
+        busy = true
+        val f = pages[i]
+        worker.execute {
+            var err: Throwable? = null
+            try {
+                val bmp = BitmapFactory.decodeFile(f.absolutePath)
+                    ?: throw IllegalStateException("Image load failed")
+                val m = Matrix()
+                m.postRotate(90f)
+                val r = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                FileOutputStream(f).use { r.compress(Bitmap.CompressFormat.JPEG, 90, it) }
+                bmp.recycle()
+                r.recycle()
+            } catch (e: Throwable) {
+                err = e
+            }
+            runOnUiThread {
+                busy = false
+                if (err != null) {
+                    cropRects[i].set(c)
+                    toast("Rotate error: $err")
+                } else {
+                    cropRects[i].set(1f - c.bottom, c.left, 1f - c.top, c.right)
+                }
+                if (screen == "crop") showCrop(i)
+            }
+        }
+    }
+
+    private fun applyCropNow(i: Int) {
+        if (busy) return
+        val cv = cropView ?: return
+        val r = RectF(cv.crop)
+        if (r.left <= 0.001f && r.top <= 0.001f && r.right >= 0.999f && r.bottom >= 0.999f) {
+            toast("Drag the blue dots to select the crop area first")
+            return
+        }
+        busy = true
+        val src = pages[i]
+        val dst = File(pagesDir(), "p_${System.nanoTime()}.jpg")
+        worker.execute {
+            var err: Throwable? = null
+            try {
+                applyEdit(src, r, 0, dst)
+            } catch (e: Throwable) {
+                err = e
+            }
+            runOnUiThread {
+                busy = false
+                if (err != null) {
+                    dst.delete()
+                    cropRects[i].set(r)
+                    toast("Crop error: $err")
+                } else {
+                    src.delete()
+                    pages[i] = dst
+                    cropRects[i].set(0f, 0f, 1f, 1f)
+                }
+                if (screen == "crop") showCrop(i)
+            }
+        }
     }
 
     private fun cropNext() {
@@ -802,7 +965,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ---------- rotate / re-crop / delete ----------
+    // ---------- rotate / re-crop / delete (Stage 3) ----------
 
     private fun showEdit(i: Int) {
         screen = "edit"
@@ -980,7 +1143,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ---------- Stage 4: naam, PDF/JPG, Share, Download ----------
+    // ---------- Final screen (Stage 4): name, Save as PDF / JPG, Share ----------
 
     private fun baseName(): String {
         var n = (nameInput?.text?.toString() ?: scanName).trim()
@@ -1005,7 +1168,6 @@ class MainActivity : ComponentActivity() {
         cropRects.clear()
         filterIdx = 0
         scanName = ""
-        fmt = "pdf"
         File(cacheDir, "share").deleteRecursively()
     }
 
@@ -1020,7 +1182,7 @@ class MainActivity : ComponentActivity() {
         head.orientation = LinearLayout.VERTICAL
         head.setBackgroundColor(BLUE)
         head.setPadding(dp(24), dp(40), dp(24), dp(18))
-        head.addView(label("PDF taiyar hai", 24f, Color.WHITE))
+        head.addView(label("PDF is ready", 24f, Color.WHITE))
         head.addView(label("${edited.size} page(s)", 14f, Color.parseColor("#D6EEFF")))
         root.addView(head, lp(MATCH, WRAP))
 
@@ -1045,7 +1207,7 @@ class MainActivity : ComponentActivity() {
         hs.addView(row)
         body.addView(hs)
 
-        val nl = label("File ka naam", 13f, Color.parseColor("#455A64"))
+        val nl = label("File name", 13f, Color.parseColor("#455A64"))
         nl.setPadding(0, dp(18), 0, dp(6))
         body.addView(nl)
 
@@ -1059,30 +1221,18 @@ class MainActivity : ComponentActivity() {
         nameInput = et
         body.addView(et, lp(MATCH, WRAP))
 
-        val fl = label("Format chuno", 13f, Color.parseColor("#455A64"))
-        fl.setPadding(0, dp(18), 0, dp(6))
-        body.addView(fl)
-
-        val chips = LinearLayout(this)
-        chips.orientation = LinearLayout.HORIZONTAL
-        val c1 = lp(0, dp(48), 1f)
-        c1.rightMargin = dp(6)
-        val c2 = lp(0, dp(48), 1f)
-        c2.leftMargin = dp(6)
-        chips.addView(chip("Save as PDF", fmt == "pdf") {
-            scanName = baseName()
-            fmt = "pdf"
-            showNext()
-        }, c1)
-        chips.addView(chip("Save as JPG", fmt == "jpg") {
-            scanName = baseName()
-            fmt = "jpg"
-            showNext()
-        }, c2)
-        body.addView(chips, lp(MATCH, WRAP))
-
         val acts = LinearLayout(this)
         acts.orientation = LinearLayout.HORIZONTAL
+        val a1 = lp(0, dp(58), 1f)
+        a1.rightMargin = dp(6)
+        acts.addView(pill("Save as PDF", GREEN) { doSave(true) }, a1)
+        val a2 = lp(0, dp(58), 1f)
+        a2.leftMargin = dp(6)
+        acts.addView(pill("Save as JPG", BLUE) { doSave(false) }, a2)
+        val alp = lp(MATCH, WRAP)
+        alp.topMargin = dp(22)
+        body.addView(acts, alp)
+
         val share = TextView(this)
         share.text = "Share"
         share.textSize = 17f
@@ -1094,18 +1244,12 @@ class MainActivity : ComponentActivity() {
         sd.setColor(Color.WHITE)
         sd.setStroke(dp(2), BLUE)
         share.background = sd
-        share.setOnClickListener { doShare() }
-        val a1 = lp(0, dp(58), 1f)
-        a1.rightMargin = dp(6)
-        acts.addView(share, a1)
-        val a2 = lp(0, dp(58), 1f)
-        a2.leftMargin = dp(6)
-        acts.addView(pill("Download", GREEN) { doDownload() }, a2)
-        val alp = lp(MATCH, WRAP)
-        alp.topMargin = dp(20)
-        body.addView(acts, alp)
+        share.setOnClickListener { askShare() }
+        val slp = lp(MATCH, dp(58))
+        slp.topMargin = dp(12)
+        body.addView(share, slp)
 
-        val st = label("Download dabane par hi phone mein save hoga.", 13f, Color.parseColor("#455A64"))
+        val st = label("Tap Save as PDF or Save as JPG to save on your phone.", 13f, Color.parseColor("#455A64"))
         st.setPadding(0, dp(14), 0, 0)
         statusView = st
         body.addView(st)
@@ -1133,14 +1277,20 @@ class MainActivity : ComponentActivity() {
         showEdit(0)
     }
 
-    private fun doShare() {
+    private fun askShare() {
+        AlertDialog.Builder(this)
+            .setTitle("Share as")
+            .setItems(arrayOf("PDF", "JPG")) { _, which -> doShare(which == 0) }
+            .show()
+    }
+
+    private fun doShare(asPdf: Boolean) {
         if (busy) return
         busy = true
         val base = baseName()
         scanName = base
         val files = edited.toList()
-        val asPdf = fmt == "pdf"
-        setStatus("Share ke liye taiyar ho raha hai...")
+        setStatus("Preparing to share...")
         worker.execute {
             var uris: ArrayList<Uri>? = null
             var err: Throwable? = null
@@ -1193,14 +1343,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun doDownload() {
+    private fun doSave(asPdf: Boolean) {
         if (busy) return
         busy = true
         val base = baseName()
         scanName = base
         val files = edited.toList()
-        val asPdf = fmt == "pdf"
-        setStatus("Save ho raha hai...")
+        setStatus("Saving...")
         worker.execute {
             var msg = ""
             var err: Throwable? = null
@@ -1214,11 +1363,11 @@ class MainActivity : ComponentActivity() {
                         Environment.DIRECTORY_DOWNLOADS + "/PDFScanner"
                     )
                     val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-                        ?: throw IllegalStateException("File nahi ban payi")
+                        ?: throw IllegalStateException("Could not create file")
                     val os = contentResolver.openOutputStream(uri)
-                        ?: throw IllegalStateException("File nahi khul payi")
+                        ?: throw IllegalStateException("Could not open file")
                     os.buffered().use { buildPdf(files, it) }
-                    msg = "PDF save ho gayi: Downloads/PDFScanner/$base.pdf"
+                    msg = "PDF saved: Downloads/PDFScanner/$base.pdf"
                 } else {
                     for (k in files.indices) {
                         val values = ContentValues()
@@ -1229,12 +1378,12 @@ class MainActivity : ComponentActivity() {
                             Environment.DIRECTORY_PICTURES + "/PDFScanner"
                         )
                         val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                            ?: throw IllegalStateException("File nahi ban payi")
+                            ?: throw IllegalStateException("Could not create file")
                         val os = contentResolver.openOutputStream(uri)
-                            ?: throw IllegalStateException("File nahi khul payi")
+                            ?: throw IllegalStateException("Could not open file")
                         os.use { out -> files[k].inputStream().use { it.copyTo(out) } }
                     }
-                    msg = "JPG save ho gayi: Pictures/PDFScanner"
+                    msg = "JPG saved: Pictures/PDFScanner"
                 }
             } catch (e: Throwable) {
                 err = e
@@ -1254,7 +1403,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ---------- screens ----------
+    // ---------- camera screen ----------
 
     private fun showCamera() {
         screen = "camera"
