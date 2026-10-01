@@ -5,6 +5,7 @@
         android:name="android.hardware.camera.any"
         android:required="false" />
     <application
+        android:icon="@mipmap/ic_launcher"
         android:label="PDF Scanner"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
