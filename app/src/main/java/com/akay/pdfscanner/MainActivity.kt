@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Context
+import android.content.DialogInterface
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -233,11 +234,12 @@ class CropView(context: Context) : View(context) {
     }
 }
 
-// ---------- Transparent round icons: 0 = bin, 1 = crop, 2 = rotate ----------
+// ---------- Transparent round icons: 0 = bin (red), 1 = crop, 2 = rotate ----------
 class IconView(context: Context, private val kind: Int) : View(context) {
     private val d = resources.displayMetrics.density
     private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
     private val line = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val binLine = Paint(Paint.ANTI_ALIAS_FLAG)
     private val solid = Paint(Paint.ANTI_ALIAS_FLAG)
     private val path = Path()
 
@@ -248,6 +250,11 @@ class IconView(context: Context, private val kind: Int) : View(context) {
         line.strokeWidth = 2.2f * d
         line.strokeCap = Paint.Cap.ROUND
         line.strokeJoin = Paint.Join.ROUND
+        binLine.color = Color.parseColor("#FF5252")
+        binLine.style = Paint.Style.STROKE
+        binLine.strokeWidth = 2.4f * d
+        binLine.strokeCap = Paint.Cap.ROUND
+        binLine.strokeJoin = Paint.Join.ROUND
         solid.color = line.color
         solid.style = Paint.Style.FILL
     }
@@ -261,21 +268,22 @@ class IconView(context: Context, private val kind: Int) : View(context) {
         fun fy(f: Float): Float = oy + f * s
         when (kind) {
             0 -> {
-                canvas.drawLine(fx(0.28f), fy(0.33f), fx(0.72f), fy(0.33f), line)
+                val p = binLine
+                canvas.drawLine(fx(0.28f), fy(0.33f), fx(0.72f), fy(0.33f), p)
                 path.reset()
                 path.moveTo(fx(0.42f), fy(0.33f))
                 path.lineTo(fx(0.42f), fy(0.26f))
                 path.lineTo(fx(0.58f), fy(0.26f))
                 path.lineTo(fx(0.58f), fy(0.33f))
-                canvas.drawPath(path, line)
+                canvas.drawPath(path, p)
                 path.reset()
                 path.moveTo(fx(0.33f), fy(0.39f))
                 path.lineTo(fx(0.37f), fy(0.74f))
                 path.lineTo(fx(0.63f), fy(0.74f))
                 path.lineTo(fx(0.67f), fy(0.39f))
-                canvas.drawPath(path, line)
-                canvas.drawLine(fx(0.46f), fy(0.47f), fx(0.46f), fy(0.66f), line)
-                canvas.drawLine(fx(0.54f), fy(0.47f), fx(0.54f), fy(0.66f), line)
+                canvas.drawPath(path, p)
+                canvas.drawLine(fx(0.46f), fy(0.47f), fx(0.46f), fy(0.66f), p)
+                canvas.drawLine(fx(0.54f), fy(0.47f), fx(0.54f), fy(0.66f), p)
             }
             1 -> {
                 path.reset()
@@ -334,7 +342,6 @@ class MainActivity : ComponentActivity() {
     private val filterLabels = ArrayList<TextView>()
     private var filterIdx = 0
     private var cropIndex = 0
-    private var editIndex = 0
     private var cropView: CropView? = null
     private var busy = false
 
@@ -431,29 +438,6 @@ class MainActivity : ComponentActivity() {
         t.setTypeface(null, Typeface.BOLD)
         t.gravity = Gravity.CENTER
         t.background = rounded(color, 28)
-        t.setOnClickListener { onClick() }
-        return t
-    }
-
-    private fun tool(text: String, onClick: () -> Unit): TextView {
-        val t = TextView(this)
-        t.text = text
-        t.textSize = 13f
-        t.setTextColor(Color.WHITE)
-        t.setTypeface(null, Typeface.BOLD)
-        t.gravity = Gravity.CENTER
-        t.background = rounded(Color.parseColor("#3A3A3A"), 14)
-        t.setOnClickListener { onClick() }
-        return t
-    }
-
-    private fun arrow(text: String, onClick: () -> Unit): TextView {
-        val t = TextView(this)
-        t.text = text
-        t.textSize = 24f
-        t.setTextColor(Color.WHITE)
-        t.gravity = Gravity.CENTER
-        t.background = oval(Color.argb(150, 0, 0, 0))
         t.setOnClickListener { onClick() }
         return t
     }
@@ -579,7 +563,7 @@ class MainActivity : ComponentActivity() {
 
     private fun applyEdit(src: File, rect: RectF, fi: Int, dst: File) {
         val bmp = BitmapFactory.decodeFile(src.absolutePath)
-            ?: throw IllegalStateException("Image load nahi hui")
+            ?: throw IllegalStateException("Image load failed")
         val x = (rect.left * bmp.width).toInt().coerceIn(0, bmp.width - 1)
         val y = (rect.top * bmp.height).toInt().coerceIn(0, bmp.height - 1)
         val w = ((rect.right - rect.left) * bmp.width).toInt().coerceIn(1, bmp.width - x)
@@ -724,7 +708,7 @@ class MainActivity : ComponentActivity() {
         showCrop(0)
     }
 
-    // ---------- crop + filters (Stage 2) ----------
+    // ---------- Stage 2: crop + filters + rotate + bin ----------
 
     private fun updateFilterSelection() {
         for (i in filterFrames.indices) {
@@ -812,7 +796,7 @@ class MainActivity : ComponentActivity() {
         icons.gravity = Gravity.CENTER_VERTICAL
         icons.setPadding(dp(18), 0, dp(18), dp(8))
         val binIcon = IconView(this, 0)
-        binIcon.setOnClickListener { deleteInCrop(i) }
+        binIcon.setOnClickListener { confirmDelete(i) }
         icons.addView(binIcon, lp(dp(46), dp(46)))
         icons.addView(View(this), lp(0, 1, 1f))
         val cropIcon = IconView(this, 1)
@@ -843,8 +827,21 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
+    private fun confirmDelete(i: Int) {
+        if (busy) return
+        val dlg = AlertDialog.Builder(this)
+            .setMessage("Do you want to delete this page?")
+            .setPositiveButton("Yes") { _, _ -> deleteInCrop(i) }
+            .setNegativeButton("No", null)
+            .create()
+        dlg.show()
+        dlg.getButton(DialogInterface.BUTTON_POSITIVE).setTextColor(BLUE)
+        dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setTextColor(BLUE)
+    }
+
     private fun deleteInCrop(i: Int) {
         if (busy) return
+        if (i >= pages.size) return
         pages[i].delete()
         pages.removeAt(i)
         if (i < cropRects.size) cropRects.removeAt(i)
@@ -959,191 +956,13 @@ class MainActivity : ComponentActivity() {
                     for (f in edited) f.delete()
                     edited.clear()
                     edited.addAll(out)
-                    showEdit(0)
+                    showNext()
                 }
             }
         }
     }
 
-    // ---------- rotate / re-crop / delete (Stage 3) ----------
-
-    private fun showEdit(i: Int) {
-        screen = "edit"
-        editIndex = i
-        val n = edited.size
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#121212"))
-
-        val head = LinearLayout(this)
-        head.orientation = LinearLayout.VERTICAL
-        head.gravity = Gravity.CENTER_HORIZONTAL
-        head.setPadding(0, dp(28), 0, dp(8))
-        head.addView(label("Edit", 22f, Color.WHITE))
-        head.addView(label("Page ${i + 1} of $n", 14f, Color.parseColor("#9E9E9E")))
-        root.addView(head, lp(MATCH, WRAP))
-
-        val area = FrameLayout(this)
-        val iv = ImageView(this)
-        iv.scaleType = ImageView.ScaleType.FIT_CENTER
-        iv.setPadding(dp(12), dp(8), dp(12), dp(8))
-        iv.setImageBitmap(thumb(edited[i], 1600))
-        var downX = 0f
-        iv.setOnTouchListener { _, e ->
-            if (e.action == MotionEvent.ACTION_DOWN) {
-                downX = e.x
-            } else if (e.action == MotionEvent.ACTION_UP) {
-                val dx = e.x - downX
-                if (dx > dp(80) && i > 0) {
-                    showEdit(i - 1)
-                } else if (dx < -dp(80) && i < n - 1) {
-                    showEdit(i + 1)
-                }
-            }
-            true
-        }
-        area.addView(iv, FrameLayout.LayoutParams(MATCH, MATCH))
-        if (i > 0) {
-            val a = FrameLayout.LayoutParams(dp(44), dp(44), Gravity.START or Gravity.CENTER_VERTICAL)
-            a.leftMargin = dp(6)
-            area.addView(arrow("<") { showEdit(i - 1) }, a)
-        }
-        if (i < n - 1) {
-            val a = FrameLayout.LayoutParams(dp(44), dp(44), Gravity.END or Gravity.CENTER_VERTICAL)
-            a.rightMargin = dp(6)
-            area.addView(arrow(">") { showEdit(i + 1) }, a)
-        }
-        root.addView(area, lp(MATCH, 0, 1f))
-
-        val tools = LinearLayout(this)
-        tools.orientation = LinearLayout.HORIZONTAL
-        tools.setPadding(dp(12), dp(8), dp(12), dp(4))
-        val names = listOf("Rotate L", "Rotate R", "Crop", "Delete")
-        for (k in names.indices) {
-            val b = tool(names[k]) {
-                when (k) {
-                    0 -> rotateEdited(i, -90f)
-                    1 -> rotateEdited(i, 90f)
-                    2 -> showRecrop(i)
-                    else -> deleteEdited(i)
-                }
-            }
-            if (k == 3) b.setTextColor(Color.parseColor("#FF8A80"))
-            val l = lp(0, dp(48), 1f)
-            l.leftMargin = dp(4)
-            l.rightMargin = dp(4)
-            tools.addView(b, l)
-        }
-        root.addView(tools, lp(MATCH, WRAP))
-
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.gravity = Gravity.CENTER_VERTICAL
-        bar.setPadding(dp(16), dp(8), dp(16), dp(20))
-        bar.addView(pill("Back", Color.parseColor("#3A3A3A")) { showCrop(0) }, lp(dp(96), dp(52)))
-        bar.addView(View(this), lp(0, 1, 1f))
-        bar.addView(pill("Next", GREEN) { showNext() }, lp(dp(110), dp(56)))
-        root.addView(bar)
-        setContentView(root)
-    }
-
-    private fun rotateEdited(i: Int, deg: Float) {
-        if (busy) return
-        busy = true
-        val f = edited[i]
-        worker.execute {
-            var err: Throwable? = null
-            try {
-                val bmp = BitmapFactory.decodeFile(f.absolutePath)
-                    ?: throw IllegalStateException("Image load nahi hui")
-                val m = Matrix()
-                m.postRotate(deg)
-                val r = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
-                FileOutputStream(f).use { r.compress(Bitmap.CompressFormat.JPEG, 90, it) }
-                bmp.recycle()
-                r.recycle()
-            } catch (e: Throwable) {
-                err = e
-            }
-            runOnUiThread {
-                busy = false
-                if (err != null) toast("Rotate error: $err")
-                if (screen == "edit") showEdit(i)
-            }
-        }
-    }
-
-    private fun deleteEdited(i: Int) {
-        if (busy) return
-        edited.removeAt(i).delete()
-        if (i < pages.size) pages.removeAt(i).delete()
-        if (i < cropRects.size) cropRects.removeAt(i)
-        if (edited.isEmpty()) showCamera() else showEdit(minOf(i, edited.size - 1))
-    }
-
-    private fun showRecrop(i: Int) {
-        screen = "recrop"
-        editIndex = i
-        val n = edited.size
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#121212"))
-
-        val head = LinearLayout(this)
-        head.orientation = LinearLayout.VERTICAL
-        head.gravity = Gravity.CENTER_HORIZONTAL
-        head.setPadding(0, dp(28), 0, dp(8))
-        head.addView(label("Crop", 22f, Color.WHITE))
-        head.addView(label("Page ${i + 1} of $n", 14f, Color.parseColor("#9E9E9E")))
-        root.addView(head, lp(MATCH, WRAP))
-
-        val cv = CropView(this)
-        cv.bitmap = thumb(edited[i], 1600)
-        cropView = cv
-        root.addView(cv, lp(MATCH, 0, 1f))
-
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.gravity = Gravity.CENTER_VERTICAL
-        bar.setPadding(dp(16), dp(8), dp(16), dp(20))
-        bar.addView(pill("Cancel", Color.parseColor("#3A3A3A")) { showEdit(i) }, lp(dp(104), dp(52)))
-        bar.addView(View(this), lp(0, 1, 1f))
-        bar.addView(iconText("Reset crop", 15f) { cropView?.resetCrop() }, lp(WRAP, WRAP))
-        bar.addView(View(this), lp(0, 1, 1f))
-        bar.addView(pill("Done", GREEN) { applyRecrop(i) }, lp(dp(110), dp(56)))
-        root.addView(bar)
-        setContentView(root)
-    }
-
-    private fun applyRecrop(i: Int) {
-        if (busy) return
-        val cv = cropView ?: return
-        val rect = RectF(cv.crop)
-        busy = true
-        val src = edited[i]
-        val d = File(pagesDir(), "e_${System.nanoTime()}.jpg")
-        worker.execute {
-            var err: Throwable? = null
-            try {
-                applyEdit(src, rect, 0, d)
-            } catch (e: Throwable) {
-                err = e
-            }
-            runOnUiThread {
-                busy = false
-                if (err != null) {
-                    d.delete()
-                    toast("Crop error: $err")
-                } else {
-                    src.delete()
-                    edited[i] = d
-                }
-                showEdit(i)
-            }
-        }
-    }
-
-    // ---------- Final screen (Stage 4): name, Save as PDF / JPG, Share ----------
+    // ---------- Stage 3: file name, Save as PDF / JPG, Share ----------
 
     private fun baseName(): String {
         var n = (nameInput?.text?.toString() ?: scanName).trim()
@@ -1274,7 +1093,7 @@ class MainActivity : ComponentActivity() {
 
     private fun leaveFinal() {
         scanName = baseName()
-        showEdit(0)
+        if (pages.isEmpty()) showCamera() else showCrop(pages.size - 1)
     }
 
     private fun askShare() {
@@ -1403,7 +1222,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ---------- camera screen ----------
+    // ---------- Stage 1: camera screen ----------
 
     private fun showCamera() {
         screen = "camera"
@@ -1531,8 +1350,6 @@ class MainActivity : ComponentActivity() {
                 when (screen) {
                     "camera" -> finish()
                     "crop" -> cropBack()
-                    "edit" -> showCrop(0)
-                    "recrop" -> showEdit(editIndex)
                     "next" -> leaveFinal()
                     else -> showCamera()
                 }
