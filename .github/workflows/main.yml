@@ -32,10 +32,12 @@ jobs:
           arch: x86_64
           script: |
             adb install -r app/build/outputs/apk/debug/app-debug.apk
+            adb shell pm grant com.akay.pdfscanner android.permission.CAMERA || true
+            adb shell pm grant com.akay.pdfscanner android.permission.READ_MEDIA_IMAGES || true
             adb logcat -c
-            adb shell am start -W -n com.akay.pdfscanner/.MainActivity
-            sleep 20
-            adb logcat -d | grep -E "AndroidRuntime|FATAL|akay" | tail -n 60 > crash.txt
+            adb shell am start -W -n com.akay.pdfscanner/.MainActivity --es mode scan
+            sleep 25
+            adb logcat -d | grep -E "AndroidRuntime|FATAL|akay|PDFScanner" | tail -n 80 > crash.txt
       - name: Show result
         if: always()
         run: |
@@ -43,5 +45,5 @@ jobs:
           if [ -s crash.txt ]; then
             sed 's/^/    /' crash.txt >> $GITHUB_STEP_SUMMARY
           else
-            echo 'Koi crash log nahi mila' >> $GITHUB_STEP_SUMMARY
+            echo 'No crash log found' >> $GITHUB_STEP_SUMMARY
           fi
