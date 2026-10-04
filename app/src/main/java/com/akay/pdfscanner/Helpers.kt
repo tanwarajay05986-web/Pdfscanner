@@ -1,10 +1,20 @@
 package com.akay.pdfscanner
 
 import android.graphics.BitmapFactory
+import android.util.Log
+import org.opencv.android.OpenCVLoader
+import org.opencv.core.Core
+import org.opencv.core.CvType
+import org.opencv.core.Mat
+import org.opencv.core.MatOfPoint
+import org.opencv.core.MatOfPoint2f
+import org.opencv.core.Point
+import org.opencv.core.Size
+import org.opencv.imgproc.Imgproc
 import java.io.File
 import java.io.OutputStream
+import java.nio.ByteBuffer
 import java.util.Locale
-import kotlin.math.abs
 
 // ---------- PDF writer: JPEG goes straight into the PDF (small file) ----------
 fun buildPdf(files: List<File>, out: OutputStream) {
@@ -57,141 +67,133 @@ fun buildPdf(files: List<File>, out: OutputStream) {
     out.flush()
 }
 
-// ---------- Simple document detector (works on a small gray grid) ----------
+// ---------- Document detector (OpenCV) ----------
 object DocDetector {
+    private var ready = false
+    private var failed = false
 
-    // returns normalized corners TL, TR, BR, BL or null
-    fun detect(gray: IntArray, gw: Int, gh: Int): FloatArray? {
-        val n = gw * gh
-        val hist = IntArray(256)
-        for (v in gray) hist[v.coerceIn(0, 255)]++
-        var total = 0L
-        for (t in 0 until 256) total += t.toLong() * hist[t]
-        var sumB = 0L
-        var wB = 0
-        var best = -1.0
-        var thr = 128
-        for (t in 0 until 256) {
-            wB += hist[t]
-            if (wB == 0) continue
-            val wF = n - wB
-            if (wF == 0) break
-            sumB += t.toLong() * hist[t]
-            val mB = sumB.toDouble() / wB
-            val mF = (total - sumB).toDouble() / wF
-            val between = wB.toDouble() * wF.toDouble() * (mB - mF) * (mB - mF)
-            if (between > best) {
-                best = between
-                thr = t
-            }
+    fun available(): Boolean {
+        if (ready) return true
+        if (failed) return false
+        try {
+            ready = OpenCVLoader.initLocal()
+            if (!ready) failed = true
+            Log.i("PDFScanner", "OpenCV init: $ready")
+        } catch (e: Throwable) {
+            failed = true
+            ready = false
+            Log.e("PDFScanner", "OpenCV init failed", e)
         }
-        var c0 = 0
-        var s0 = 0L
-        var c1 = 0
-        var s1 = 0L
-        for (v in gray) {
-            if (v <= thr) {
-                c0++
-                s0 += v
-            } else {
-                c1++
-                s1 += v
-            }
-        }
-        if (c0 == 0 || c1 == 0) return null
-        if (s1.toDouble() / c1 - s0.toDouble() / c0 < 40.0) return null
-        val a = findQuad(gray, gw, gh, thr, true)
-        if (a != null) return a
-        return findQuad(gray, gw, gh, thr, false)
+        return ready
     }
 
-    private fun polyArea(q: FloatArray): Float {
-        var a = 0f
-        for (i in 0 until 4) {
-            val j = (i + 1) % 4
-            a += q[2 * i] * q[2 * j + 1] - q[2 * j] * q[2 * i + 1]
+    // returns normalized corners TL, TR, BR, BL of the upright image, or null
+    fun detect(buf: ByteBuffer, w: Int, h: Int, rowStride: Int, rot: Int): FloatArray? {
+        val src = Mat(h, w, CvType.CV_8UC1)
+        val up = Mat()
+        val small = Mat()
+        try {
+            val row = ByteArray(w)
+            for (y in 0 until h) {
+                buf.position(y * rowStride)
+                buf.get(row, 0, w)
+                src.put(y, 0, row)
+            }
+            when (rot) {
+                90 -> Core.rotate(src, up, Core.ROTATE_90_CLOCKWISE)
+                180 -> Core.rotate(src, up, Core.ROTATE_180)
+                270 -> Core.rotate(src, up, Core.ROTATE_90_COUNTERCLOCKWISE)
+                else -> src.copyTo(up)
+            }
+            val scale = 240.0 / maxOf(up.cols(), up.rows())
+            Imgproc.resize(up, small, Size(up.cols() * scale, up.rows() * scale))
+            return findDoc(small)
+        } finally {
+            src.release()
+            up.release()
+            small.release()
         }
-        return abs(a) / 2f
     }
 
-    private fun findQuad(gray: IntArray, gw: Int, gh: Int, thr: Int, bright: Boolean): FloatArray? {
-        val n = gw * gh
-        val mask = BooleanArray(n)
-        for (i in 0 until n) mask[i] = if (bright) gray[i] > thr else gray[i] <= thr
-        val seen = BooleanArray(n)
-        val stack = IntArray(n)
-        var bestArea = 0
+    private fun findDoc(gray: Mat): FloatArray? {
+        val w = gray.cols()
+        val h = gray.rows()
+        val blur = Mat()
+        val edges = Mat()
+        val k = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
+        try {
+            Imgproc.GaussianBlur(gray, blur, Size(5.0, 5.0), 0.0)
+            val mean = Core.mean(blur).`val`[0]
+            val low = (0.4 * mean).coerceIn(25.0, 70.0)
+            Imgproc.Canny(blur, edges, low, low * 2.5)
+            Imgproc.dilate(edges, edges, k)
+            var best = bestQuad(edges, w, h)
+            if (best == null) {
+                val bin = Mat()
+                Imgproc.threshold(blur, bin, 0.0, 255.0, Imgproc.THRESH_BINARY + Imgproc.THRESH_OTSU)
+                best = bestQuad(bin, w, h)
+                if (best == null) {
+                    Core.bitwise_not(bin, bin)
+                    best = bestQuad(bin, w, h)
+                }
+                bin.release()
+            }
+            return best
+        } finally {
+            blur.release()
+            edges.release()
+            k.release()
+        }
+    }
+
+    private fun bestQuad(bin: Mat, w: Int, h: Int): FloatArray? {
+        val contours = ArrayList<MatOfPoint>()
+        val hier = Mat()
+        Imgproc.findContours(bin, contours, hier, Imgproc.RETR_LIST, Imgproc.CHAIN_APPROX_SIMPLE)
+        hier.release()
+        val frame = (w * h).toDouble()
+        var bestArea = 0.0
         var best: FloatArray? = null
-        for (start in 0 until n) {
-            if (!mask[start] || seen[start]) continue
-            var sp = 0
-            stack[sp++] = start
-            seen[start] = true
-            var area = 0
-            var minS = Int.MAX_VALUE
-            var maxS = Int.MIN_VALUE
-            var minD = Int.MAX_VALUE
-            var maxD = Int.MIN_VALUE
-            var tl = start
-            var br = start
-            var tr = start
-            var bl = start
-            while (sp > 0) {
-                sp--
-                val p = stack[sp]
-                area++
-                val x = p % gw
-                val y = p / gw
-                val s = x + y
-                val d = x - y
-                if (s < minS) {
-                    minS = s
-                    tl = p
-                }
-                if (s > maxS) {
-                    maxS = s
-                    br = p
-                }
-                if (d > maxD) {
-                    maxD = d
-                    tr = p
-                }
-                if (d < minD) {
-                    minD = d
-                    bl = p
-                }
-                if (x > 0 && mask[p - 1] && !seen[p - 1]) {
-                    seen[p - 1] = true
-                    stack[sp++] = p - 1
-                }
-                if (x < gw - 1 && mask[p + 1] && !seen[p + 1]) {
-                    seen[p + 1] = true
-                    stack[sp++] = p + 1
-                }
-                if (y > 0 && mask[p - gw] && !seen[p - gw]) {
-                    seen[p - gw] = true
-                    stack[sp++] = p - gw
-                }
-                if (y < gh - 1 && mask[p + gw] && !seen[p + gw]) {
-                    seen[p + gw] = true
-                    stack[sp++] = p + gw
+        for (c in contours) {
+            val area = Imgproc.contourArea(c)
+            if (area < frame * 0.18 || area > frame * 0.97 || area <= bestArea) {
+                c.release()
+                continue
+            }
+            val c2f = MatOfPoint2f(*c.toArray())
+            val peri = Imgproc.arcLength(c2f, true)
+            val approx = MatOfPoint2f()
+            Imgproc.approxPolyDP(c2f, approx, 0.02 * peri, true)
+            if (approx.total() == 4L) {
+                val pts = approx.toArray()
+                if (Imgproc.isContourConvex(MatOfPoint(*pts))) {
+                    bestArea = area
+                    best = orderQuad(pts, w, h)
                 }
             }
-            if (area <= bestArea) continue
-            if (area < n * 0.2 || area > n * 0.92) continue
-            val q = floatArrayOf(
-                (tl % gw).toFloat() / gw, (tl / gw).toFloat() / gh,
-                ((tr % gw) + 1f) / gw, (tr / gw).toFloat() / gh,
-                ((br % gw) + 1f) / gw, ((br / gw) + 1f) / gh,
-                (bl % gw).toFloat() / gw, ((bl / gw) + 1f) / gh
-            )
-            val qa = polyArea(q)
-            if (qa < 0.2f) continue
-            val fill = (area.toFloat() / n) / qa
-            if (fill < 0.72f) continue
-            bestArea = area
-            best = q
+            c2f.release()
+            approx.release()
+            c.release()
         }
         return best
+    }
+
+    private fun orderQuad(p: Array<Point>, w: Int, h: Int): FloatArray {
+        var tl = p[0]
+        var br = p[0]
+        var tr = p[0]
+        var bl = p[0]
+        for (q in p) {
+            if (q.x + q.y < tl.x + tl.y) tl = q
+            if (q.x + q.y > br.x + br.y) br = q
+            if (q.x - q.y > tr.x - tr.y) tr = q
+            if (q.x - q.y < bl.x - bl.y) bl = q
+        }
+        return floatArrayOf(
+            (tl.x / w).toFloat(), (tl.y / h).toFloat(),
+            (tr.x / w).toFloat(), (tr.y / h).toFloat(),
+            (br.x / w).toFloat(), (br.y / h).toFloat(),
+            (bl.x / w).toFloat(), (bl.y / h).toFloat()
+        )
     }
 }
