@@ -8,6 +8,7 @@ import android.graphics.ColorFilter
 import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.cos
@@ -156,14 +157,16 @@ class CropView(context: Context) : View(context) {
     }
 }
 
-// ---------- Overlay on camera: detected document box + hint ----------
+// ---------- Camera overlay: detected document box, ID guide corners, hint pill ----------
 class DetectView(context: Context) : View(context) {
     private var quad: FloatArray? = null
     private var aspect = 0.75f
     private var hint = ""
+    var showFrame = false
     private val d = resources.displayMetrics.density
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stroke = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val frameP = Paint(Paint.ANTI_ALIAS_FLAG)
     private val pillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val textPaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val path = Path()
@@ -174,9 +177,15 @@ class DetectView(context: Context) : View(context) {
         stroke.style = Paint.Style.STROKE
         stroke.strokeWidth = 3f * d
         stroke.strokeJoin = Paint.Join.ROUND
-        pillPaint.color = Color.argb(200, 30, 30, 30)
+        frameP.color = Color.parseColor("#38B6FF")
+        frameP.style = Paint.Style.STROKE
+        frameP.strokeWidth = 4.5f * d
+        frameP.strokeCap = Paint.Cap.ROUND
+        frameP.strokeJoin = Paint.Join.ROUND
+        pillPaint.color = Color.argb(190, 40, 40, 40)
         textPaint.color = Color.WHITE
-        textPaint.textSize = 15f * d
+        textPaint.textSize = 18f * d
+        textPaint.typeface = Typeface.DEFAULT_BOLD
     }
 
     fun update(q: FloatArray?, a: Float, h: String) {
@@ -184,6 +193,41 @@ class DetectView(context: Context) : View(context) {
         aspect = a
         hint = h
         invalidate()
+    }
+
+    private fun drawFrame(canvas: Canvas, ox: Float, oy: Float, rw: Float, rh: Float) {
+        val fw = rw * 0.82f
+        val fh = fw / 1.586f
+        val l = ox + (rw - fw) / 2f
+        val t = oy + (rh - fh) / 2f
+        val r = l + fw
+        val b = t + fh
+        val len = fw * 0.14f
+        val rad = fw * 0.05f
+        path.reset()
+        path.moveTo(l, t + len)
+        path.lineTo(l, t + rad)
+        path.quadTo(l, t, l + rad, t)
+        path.lineTo(l + len, t)
+        canvas.drawPath(path, frameP)
+        path.reset()
+        path.moveTo(r - len, t)
+        path.lineTo(r - rad, t)
+        path.quadTo(r, t, r, t + rad)
+        path.lineTo(r, t + len)
+        canvas.drawPath(path, frameP)
+        path.reset()
+        path.moveTo(r, b - len)
+        path.lineTo(r, b - rad)
+        path.quadTo(r, b, r - rad, b)
+        path.lineTo(r - len, b)
+        canvas.drawPath(path, frameP)
+        path.reset()
+        path.moveTo(l + len, b)
+        path.lineTo(l + rad, b)
+        path.quadTo(l, b, l, b - rad)
+        path.lineTo(l, b - len)
+        canvas.drawPath(path, frameP)
     }
 
     override fun onDraw(canvas: Canvas) {
@@ -197,6 +241,7 @@ class DetectView(context: Context) : View(context) {
         }
         val ox = (cw - rw) / 2f
         val oy = (ch - rh) / 2f
+        if (showFrame) drawFrame(canvas, ox, oy, rw, rh)
         val q = quad
         if (q != null) {
             path.reset()
@@ -208,23 +253,47 @@ class DetectView(context: Context) : View(context) {
         }
         if (hint.isNotEmpty()) {
             val tw = textPaint.measureText(hint)
-            val padX = 16f * d
-            val padY = 10f * d
+            val padX = 22f * d
+            val padY = 14f * d
+            val pillH = textPaint.textSize + 2 * padY
             val left = (cw - tw) / 2f - padX
-            val top = oy + 14f * d
-            val rect = RectF(left, top, left + tw + 2 * padX, top + textPaint.textSize + 2 * padY)
-            canvas.drawRoundRect(rect, 20f * d, 20f * d, pillPaint)
-            canvas.drawText(hint, left + padX, top + padY + textPaint.textSize * 0.85f, textPaint)
+            val top = oy + rh - pillH - 36f * d
+            val rect = RectF(left, top, left + tw + 2 * padX, top + pillH)
+            canvas.drawRoundRect(rect, pillH / 2f, pillH / 2f, pillPaint)
+            canvas.drawText(hint, left + padX, top + padY + textPaint.textSize * 0.82f, textPaint)
         }
     }
 }
 
-// ---------- Icons: 0 bin, 1 rotate, 2 gallery, 3 scan, 4 id card, 5 home, 6 upload, 7 pdf ----------
+// ---------- Shutter button: white ring + white disc ----------
+class ShutterView(context: Context) : View(context) {
+    private val ring = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val inner = Paint(Paint.ANTI_ALIAS_FLAG)
+
+    init {
+        ring.color = Color.WHITE
+        ring.style = Paint.Style.STROKE
+        inner.color = Color.WHITE
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val s = minOf(width, height).toFloat()
+        val c = s / 2f
+        ring.strokeWidth = 0.07f * s
+        canvas.drawCircle(c, c, s / 2f - ring.strokeWidth / 2f, ring)
+        canvas.drawCircle(c, c, s / 2f - 0.17f * s, inner)
+    }
+}
+
+// ---------- Icons ----------
+// 0 bin, 1 rotate, 2 image, 3 scan corners, 4 id card, 5 home, 6 download, 7 document,
+// 8 share, 9 bolt, 10 check, 11 clock, 12 cloud-download, 13 chevron-left, 14 close
 class IconView(
     context: Context,
     private val kind: Int,
     private val withBg: Boolean = false,
-    glyph: Int = Color.WHITE
+    glyph: Int = Color.WHITE,
+    private val strokeF: Float = 0.062f
 ) : View(context) {
     private val bg = Paint(Paint.ANTI_ALIAS_FLAG)
     private val line = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -241,11 +310,17 @@ class IconView(
         solid.style = Paint.Style.FILL
     }
 
+    fun setGlyph(c: Int) {
+        line.color = c
+        solid.color = c
+        invalidate()
+    }
+
     override fun onDraw(canvas: Canvas) {
         val s = minOf(width, height).toFloat()
         val ox = (width - s) / 2f
         val oy = (height - s) / 2f
-        line.strokeWidth = 0.062f * s
+        line.strokeWidth = strokeF * s
         if (withBg) canvas.drawCircle(width / 2f, height / 2f, s / 2f, bg)
 
         fun poly(close: Boolean, vararg v: Float) {
@@ -258,6 +333,16 @@ class IconView(
             }
             if (close) path.close()
             canvas.drawPath(path, line)
+        }
+
+        fun circ(cx: Float, cy: Float, r: Float) {
+            canvas.drawCircle(ox + cx * s, oy + cy * s, r * s, line)
+        }
+
+        fun rrect(l: Float, t: Float, r: Float, b: Float, rad: Float) {
+            canvas.drawRoundRect(
+                RectF(ox + l * s, oy + t * s, ox + r * s, oy + b * s), rad * s, rad * s, line
+            )
         }
 
         when (kind) {
@@ -290,29 +375,22 @@ class IconView(
                 canvas.drawPath(path, solid)
             }
             2 -> {
-                canvas.drawRoundRect(
-                    RectF(ox + 0.20f * s, oy + 0.24f * s, ox + 0.80f * s, oy + 0.76f * s),
-                    0.07f * s, 0.07f * s, line
-                )
-                canvas.drawCircle(ox + 0.37f * s, oy + 0.41f * s, 0.05f * s, solid)
-                poly(false, 0.22f, 0.72f, 0.42f, 0.51f, 0.56f, 0.65f, 0.66f, 0.55f, 0.78f, 0.69f)
+                rrect(0.18f, 0.20f, 0.82f, 0.80f, 0.09f)
+                canvas.drawCircle(ox + 0.36f * s, oy + 0.38f * s, 0.055f * s, solid)
+                poly(false, 0.20f, 0.74f, 0.42f, 0.50f, 0.56f, 0.64f, 0.66f, 0.54f, 0.80f, 0.70f)
             }
             3 -> {
-                poly(false, 0.20f, 0.36f, 0.20f, 0.20f, 0.36f, 0.20f)
-                poly(false, 0.64f, 0.20f, 0.80f, 0.20f, 0.80f, 0.36f)
-                poly(false, 0.80f, 0.64f, 0.80f, 0.80f, 0.64f, 0.80f)
-                poly(false, 0.36f, 0.80f, 0.20f, 0.80f, 0.20f, 0.64f)
-                poly(false, 0.36f, 0.40f, 0.64f, 0.40f)
-                poly(false, 0.36f, 0.50f, 0.64f, 0.50f)
-                poly(false, 0.36f, 0.60f, 0.54f, 0.60f)
+                poly(false, 0.20f, 0.40f, 0.20f, 0.22f, 0.40f, 0.22f)
+                poly(false, 0.60f, 0.22f, 0.80f, 0.22f, 0.80f, 0.40f)
+                poly(false, 0.80f, 0.60f, 0.80f, 0.78f, 0.60f, 0.78f)
+                poly(false, 0.40f, 0.78f, 0.20f, 0.78f, 0.20f, 0.60f)
             }
             4 -> {
-                canvas.drawRoundRect(
-                    RectF(ox + 0.14f * s, oy + 0.28f * s, ox + 0.86f * s, oy + 0.72f * s),
-                    0.08f * s, 0.08f * s, line
-                )
-                poly(false, 0.14f, 0.42f, 0.86f, 0.42f)
-                poly(false, 0.24f, 0.58f, 0.50f, 0.58f)
+                rrect(0.22f, 0.24f, 0.78f, 0.80f, 0.08f)
+                poly(false, 0.38f, 0.15f, 0.38f, 0.30f)
+                poly(false, 0.62f, 0.15f, 0.62f, 0.30f)
+                circ(0.5f, 0.46f, 0.07f)
+                poly(false, 0.36f, 0.68f, 0.64f, 0.68f)
             }
             5 -> {
                 poly(false, 0.16f, 0.48f, 0.50f, 0.20f, 0.84f, 0.48f)
@@ -320,15 +398,50 @@ class IconView(
                 poly(false, 0.44f, 0.80f, 0.44f, 0.60f, 0.56f, 0.60f, 0.56f, 0.80f)
             }
             6 -> {
-                poly(false, 0.50f, 0.64f, 0.50f, 0.22f)
-                poly(false, 0.35f, 0.37f, 0.50f, 0.22f, 0.65f, 0.37f)
+                poly(false, 0.50f, 0.18f, 0.50f, 0.60f)
+                poly(false, 0.34f, 0.45f, 0.50f, 0.61f, 0.66f, 0.45f)
                 poly(false, 0.20f, 0.62f, 0.20f, 0.80f, 0.80f, 0.80f, 0.80f, 0.62f)
             }
-            else -> {
+            7 -> {
                 poly(true, 0.30f, 0.20f, 0.58f, 0.20f, 0.72f, 0.34f, 0.72f, 0.80f, 0.30f, 0.80f)
                 poly(false, 0.58f, 0.20f, 0.58f, 0.34f, 0.72f, 0.34f)
                 poly(false, 0.38f, 0.52f, 0.64f, 0.52f)
                 poly(false, 0.38f, 0.64f, 0.64f, 0.64f)
+            }
+            8 -> {
+                circ(0.28f, 0.50f, 0.075f)
+                circ(0.72f, 0.26f, 0.075f)
+                circ(0.72f, 0.74f, 0.075f)
+                poly(false, 0.35f, 0.46f, 0.65f, 0.30f)
+                poly(false, 0.35f, 0.54f, 0.65f, 0.70f)
+            }
+            9 -> {
+                poly(true, 0.58f, 0.12f, 0.28f, 0.54f, 0.48f, 0.54f, 0.42f, 0.88f, 0.72f, 0.44f, 0.52f, 0.44f)
+            }
+            10 -> {
+                poly(false, 0.26f, 0.52f, 0.43f, 0.68f, 0.75f, 0.34f)
+            }
+            11 -> {
+                circ(0.5f, 0.5f, 0.32f)
+                poly(false, 0.5f, 0.5f, 0.5f, 0.30f)
+                poly(false, 0.5f, 0.5f, 0.64f, 0.58f)
+            }
+            12 -> {
+                path.reset()
+                path.moveTo(ox + 0.30f * s, oy + 0.68f * s)
+                path.cubicTo(ox + 0.10f * s, oy + 0.68f * s, ox + 0.10f * s, oy + 0.42f * s, ox + 0.32f * s, oy + 0.42f * s)
+                path.cubicTo(ox + 0.34f * s, oy + 0.20f * s, ox + 0.68f * s, oy + 0.20f * s, ox + 0.70f * s, oy + 0.44f * s)
+                path.cubicTo(ox + 0.90f * s, oy + 0.44f * s, ox + 0.90f * s, oy + 0.68f * s, ox + 0.72f * s, oy + 0.68f * s)
+                canvas.drawPath(path, line)
+                poly(false, 0.5f, 0.46f, 0.5f, 0.76f)
+                poly(false, 0.40f, 0.66f, 0.5f, 0.76f, 0.60f, 0.66f)
+            }
+            13 -> {
+                poly(false, 0.62f, 0.22f, 0.38f, 0.50f, 0.62f, 0.78f)
+            }
+            else -> {
+                poly(false, 0.28f, 0.28f, 0.72f, 0.72f)
+                poly(false, 0.72f, 0.28f, 0.28f, 0.72f)
             }
         }
     }
