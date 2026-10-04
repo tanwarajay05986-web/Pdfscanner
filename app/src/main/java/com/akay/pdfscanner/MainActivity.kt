@@ -2,6 +2,7 @@ package com.akay.pdfscanner
 
 import android.Manifest
 import android.app.AlertDialog
+import android.app.Dialog
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.DialogInterface
@@ -18,16 +19,22 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
+import android.graphics.pdf.PdfRenderer
 import android.media.ExifInterface
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.TextUtils
+import android.util.Log
 import android.view.Gravity
 import android.view.View
+import android.view.Window
+import android.view.WindowManager
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.HorizontalScrollView
@@ -65,12 +72,12 @@ class MainActivity : ComponentActivity() {
 
     private val AUTH = "com.akay.pdfscanner.fileprovider"
     private val DARK = Color.parseColor("#1C1C1C")
+    private val CIRCLE_BG = Color.parseColor("#3A3A3A")
     private val GREEN = Color.parseColor("#2E9E5B")
     private val BLUE = Color.parseColor("#0288D1")
     private val BLUE_H = Color.parseColor("#4DA3FF")
-    private val NAVY = Color.parseColor("#1A2340")
-    private val GRAY = Color.parseColor("#6B7280")
-    private val PINK = Color.parseColor("#E91E63")
+    private val NAVY = Color.parseColor("#0E1633")
+    private val GRAY = Color.parseColor("#5B6B86")
     private val MATCH = LinearLayout.LayoutParams.MATCH_PARENT
     private val WRAP = LinearLayout.LayoutParams.WRAP_CONTENT
 
@@ -92,7 +99,6 @@ class MainActivity : ComponentActivity() {
     private var autoMode = true
     private var scanName = ""
     private var nameInput: EditText? = null
-    private var statusView: TextView? = null
 
     private var screen = "home"
     private var pending = 0
@@ -105,21 +111,35 @@ class MainActivity : ComponentActivity() {
     private var thumbImg: ImageView? = null
     private var thumbBadge: TextView? = null
     private var proceedBadge: TextView? = null
+    private var counterView: TextView? = null
+    private var flashIcon: IconView? = null
+    private var autoIcon: IconView? = null
+    private var autoLabel: TextView? = null
 
     private var lastQuad: FloatArray? = null
+    private var smoothQuad: FloatArray? = null
     private var capturedQuad: FloatArray? = null
     private var stableSince = 0L
     private var invalidCount = 0
+    private var missCount = 0
     private var armed = true
     private var lastAutoAt = 0L
+    private var autoWarned = false
+    private var errLogged = 0
+
+    private val thumbCache = HashMap<String, Bitmap>()
+    private val pageCountCache = HashMap<String, Int>()
 
     private val worker = Executors.newSingleThreadExecutor()
     private val analysisExecutor = Executors.newSingleThreadExecutor()
+    private val thumbPool = Executors.newSingleThreadExecutor()
 
-    private val permLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { ok ->
-        if (ok) startCamera() else toast("Camera permission is required. Allow it in phone Settings.")
+    private val permAll = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ ->
+        if (screen == "camera") {
+            if (hasCamera()) startCamera() else toast("Camera permission is required. Allow it in phone Settings.")
+        }
     }
 
     private val galleryLauncher = registerForActivityResult(
@@ -147,6 +167,18 @@ class MainActivity : ComponentActivity() {
 
     private fun lp(w: Int, h: Int, weight: Float = 0f): LinearLayout.LayoutParams =
         LinearLayout.LayoutParams(w, h, weight)
+
+    @Suppress("DEPRECATION")
+    private fun bars(color: Int, light: Boolean) {
+        window.statusBarColor = color
+        var f = window.decorView.systemUiVisibility
+        f = if (light) {
+            f or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+        } else {
+            f and View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv()
+        }
+        window.decorView.systemUiVisibility = f
+    }
 
     private fun rounded(color: Int, radius: Int): GradientDrawable {
         val d = GradientDrawable()
@@ -186,17 +218,6 @@ class MainActivity : ComponentActivity() {
         return t
     }
 
-    private fun iconText(text: String, size: Float, onClick: () -> Unit): TextView {
-        val t = TextView(this)
-        t.text = text
-        t.textSize = size
-        t.setTextColor(Color.WHITE)
-        t.gravity = Gravity.CENTER
-        t.setPadding(dp(16), dp(10), dp(16), dp(10))
-        t.setOnClickListener { onClick() }
-        return t
-    }
-
     private fun pill(text: String, color: Int, onClick: () -> Unit): TextView {
         val t = TextView(this)
         t.text = text
@@ -207,6 +228,22 @@ class MainActivity : ComponentActivity() {
         t.background = rounded(color, 28)
         t.setOnClickListener { onClick() }
         return t
+    }
+
+    private fun circleBtn(kind: Int, onClick: () -> Unit): FrameLayout {
+        val f = FrameLayout(this)
+        f.background = oval(CIRCLE_BG)
+        f.addView(IconView(this, kind, false, Color.WHITE), FrameLayout.LayoutParams(dp(44), dp(44)))
+        f.setOnClickListener { onClick() }
+        return f
+    }
+
+    private fun squareBtn(kind: Int, bg: Int, glyph: Int, onClick: () -> Unit): FrameLayout {
+        val f = FrameLayout(this)
+        f.background = rounded(bg, 18)
+        f.addView(IconView(this, kind, false, glyph), FrameLayout.LayoutParams(dp(52), dp(52)))
+        f.setOnClickListener { onClick() }
+        return f
     }
 
     private fun pagesDir(): File {
@@ -226,6 +263,23 @@ class MainActivity : ComponentActivity() {
         pages.removeAt(i).delete()
         if (i < pageQuads.size) pageQuads.removeAt(i)
         if (i < cropPts.size) cropPts.removeAt(i)
+    }
+
+    private fun hasCamera(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+
+    private fun missingPerms(): Array<String> {
+        val l = ArrayList<String>()
+        l.add(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= 33) {
+            l.add(Manifest.permission.READ_MEDIA_IMAGES)
+        } else {
+            l.add(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        return l.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }.toTypedArray()
     }
 
     private fun exifDegrees(ei: ExifInterface): Int {
@@ -341,7 +395,6 @@ class MainActivity : ComponentActivity() {
         return ColorMatrixColorFilter(m)
     }
 
-    // crops the 4-corner area (with perspective fix) and applies the filter
     private fun applyEdit(src: File, pts: FloatArray, fi: Int, dst: File) {
         val bmp = BitmapFactory.decodeFile(src.absolutePath)
             ?: throw IllegalStateException("Image load failed")
@@ -373,7 +426,6 @@ class MainActivity : ComponentActivity() {
         out.recycle()
     }
 
-    // ID card: front and back on one A4 page
     private fun composeId(files: List<File>, dst: File) {
         val pw = 1240
         val ph = 1754
@@ -409,10 +461,20 @@ class MainActivity : ComponentActivity() {
     private fun idleHint(): String {
         if (!idMode) return ""
         return when {
-            pages.size == 0 -> "Capture the front side"
-            pages.size == 1 -> "Capture the back side"
-            else -> "Tap Proceed"
+            pages.size == 0 -> "ID Card FRONT"
+            pages.size == 1 -> "ID Card BACK"
+            else -> "Tap the green box to continue"
         }
+    }
+
+    private fun resetAutoState() {
+        armed = true
+        lastQuad = null
+        smoothQuad = null
+        capturedQuad = null
+        stableSince = 0L
+        invalidCount = 0
+        missCount = 0
     }
 
     private fun startCamera() {
@@ -435,6 +497,7 @@ class MainActivity : ComponentActivity() {
                 )
                 camera?.cameraControl?.enableTorch(torchOn)
             } catch (e: Throwable) {
+                Log.e("PDFScanner", "camera start failed", e)
                 toast("Camera error: $e")
             }
         }, ContextCompat.getMainExecutor(this))
@@ -460,16 +523,19 @@ class MainActivity : ComponentActivity() {
         runOnUiThread { detectView?.update(q, aspect, h) }
     }
 
+    private fun updateAutoPill() {
+        autoLabel?.text = if (autoMode) "Auto" else "Manual"
+        val c = if (autoMode) Color.WHITE else Color.parseColor("#9E9E9E")
+        autoLabel?.setTextColor(c)
+        autoIcon?.setGlyph(c)
+    }
+
     private fun analyze(proxy: ImageProxy) {
         try {
             if (screen != "camera") return
             val w = proxy.width
             val h = proxy.height
             val rot = proxy.imageInfo.rotationDegrees
-            val plane = proxy.planes[0]
-            val buf = plane.buffer
-            val rs = plane.rowStride
-            val ps = plane.pixelStride
             val uw = if (rot == 90 || rot == 270) h else w
             val uh = if (rot == 90 || rot == 270) w else h
             val aspect = uw.toFloat() / uh.toFloat()
@@ -477,53 +543,48 @@ class MainActivity : ComponentActivity() {
                 postOverlay(null, aspect, "")
                 return
             }
-            val sc = 96f / maxOf(uw, uh)
-            val gw = maxOf(8, (uw * sc).toInt())
-            val gh = maxOf(8, (uh * sc).toInt())
-            val gray = IntArray(gw * gh)
-            for (gy in 0 until gh) {
-                for (gx in 0 until gw) {
-                    var acc = 0
-                    var cnt = 0
-                    for (oy in -1..1) {
-                        for (ox in -1..1) {
-                            val ux = ((gx + 0.5f + ox * 0.3f) / gw * uw).toInt().coerceIn(0, uw - 1)
-                            val uy = ((gy + 0.5f + oy * 0.3f) / gh * uh).toInt().coerceIn(0, uh - 1)
-                            var sx = ux
-                            var sy = uy
-                            when (rot) {
-                                90 -> {
-                                    sx = uy
-                                    sy = h - 1 - ux
-                                }
-                                180 -> {
-                                    sx = w - 1 - ux
-                                    sy = h - 1 - uy
-                                }
-                                270 -> {
-                                    sx = w - 1 - uy
-                                    sy = ux
-                                }
-                            }
-                            acc += buf.get(sy * rs + sx * ps).toInt() and 0xFF
-                            cnt++
-                        }
+            if (!DocDetector.available()) {
+                if (!autoWarned) {
+                    autoWarned = true
+                    runOnUiThread {
+                        toast("Auto scan is not available on this phone. Use the shutter button.")
+                        autoMode = false
+                        updateAutoPill()
                     }
-                    gray[gy * gw + gx] = acc / cnt
+                }
+                return
+            }
+            val plane = proxy.planes[0]
+            val raw = DocDetector.detect(plane.buffer, w, h, plane.rowStride, rot)
+            val now = System.currentTimeMillis()
+            var quad: FloatArray? = null
+            if (raw != null) {
+                val prev = smoothQuad
+                quad = if (prev == null || maxDiff(prev, raw) > 0.15f) {
+                    raw
+                } else {
+                    FloatArray(8) { prev[it] * 0.6f + raw[it] * 0.4f }
+                }
+                smoothQuad = quad
+                missCount = 0
+            } else {
+                missCount++
+                if (missCount <= 3) {
+                    quad = smoothQuad
+                } else {
+                    smoothQuad = null
                 }
             }
-            val quad = DocDetector.detect(gray, gw, gh)
-            val now = System.currentTimeMillis()
             var hint = ""
             if (quad == null) {
-                invalidCount++
                 stableSince = 0L
                 lastQuad = null
+                invalidCount++
                 if (invalidCount >= 6) armed = true
             } else {
                 invalidCount = 0
                 val prev = lastQuad
-                if (prev != null && maxDiff(prev, quad) < 0.04f) {
+                if (prev != null && maxDiff(prev, quad) < 0.03f) {
                     if (stableSince == 0L) stableSince = now
                 } else {
                     stableSince = now
@@ -534,23 +595,28 @@ class MainActivity : ComponentActivity() {
                 val idFull = idMode && pages.size + pending >= 2
                 if (armed && !idFull && pending == 0 && now - lastAutoAt > 2500L) {
                     hint = "Hold steady..."
-                    if (now - stableSince >= 900L) {
+                    if (now - stableSince >= 1000L) {
                         armed = false
                         capturedQuad = quad
                         lastAutoAt = now
                         stableSince = 0L
-                        runOnUiThread { takePhoto(quad) }
+                        val q = quad
+                        runOnUiThread { takePhoto(q) }
                     }
                 }
             }
             postOverlay(quad, aspect, hint)
         } catch (e: Throwable) {
+            if (errLogged < 5) {
+                errLogged++
+                Log.e("PDFScanner", "analyze error", e)
+            }
         } finally {
             proxy.close()
         }
     }
 
-    private fun toggleTorch(btn: TextView) {
+    private fun toggleTorch() {
         val cam = camera
         if (cam == null) {
             toast("Camera is not ready yet")
@@ -562,8 +628,7 @@ class MainActivity : ComponentActivity() {
         }
         torchOn = !torchOn
         cam.cameraControl.enableTorch(torchOn)
-        btn.text = if (torchOn) "Flash ON" else "Flash OFF"
-        btn.setTextColor(if (torchOn) Color.YELLOW else Color.WHITE)
+        flashIcon?.setGlyph(if (torchOn) Color.YELLOW else Color.WHITE)
     }
 
     private fun takePhoto(autoQuad: FloatArray?) {
@@ -573,7 +638,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         if (idMode && pages.size + pending >= 2) {
-            if (autoQuad == null) toast("Front and back are done. Tap Proceed.")
+            if (autoQuad == null) toast("Front and back are done. Tap the green box.")
             return
         }
         val raw = File(pagesDir(), "raw_${System.nanoTime()}.jpg")
@@ -608,7 +673,7 @@ class MainActivity : ComponentActivity() {
         if (idMode) {
             val room = 2 - pages.size - pending
             if (room <= 0) {
-                toast("Front and back are done. Tap Proceed.")
+                toast("Front and back are done. Tap the green box.")
                 return
             }
             list = uris.take(room)
@@ -645,6 +710,10 @@ class MainActivity : ComponentActivity() {
             thumbBadge?.text = n.toString()
             proceedBadge?.text = n.toString()
         }
+        counterView?.let {
+            it.text = "$n/2"
+            it.background = rounded(if (n > 0) GREEN else CIRCLE_BG, 20)
+        }
     }
 
     private fun proceed() {
@@ -662,7 +731,7 @@ class MainActivity : ComponentActivity() {
         showCrop(0)
     }
 
-    // ---------- Stage 2: edit (crop dots + filters + rotate + delete) ----------
+    // ---------- Stage 3: edit (crop dots + filters + rotate + delete) ----------
 
     private fun updateFilterSelection() {
         for (i in filterFrames.indices) {
@@ -736,6 +805,7 @@ class MainActivity : ComponentActivity() {
         screen = "crop"
         cropIndex = i
         stopCamera()
+        bars(Color.parseColor("#121212"), false)
         val n = pages.size
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -743,7 +813,7 @@ class MainActivity : ComponentActivity() {
 
         val head = LinearLayout(this)
         head.orientation = LinearLayout.VERTICAL
-        head.setPadding(0, dp(28), 0, dp(8))
+        head.setPadding(0, dp(20), 0, dp(8))
         val t1 = boldLabel("Edit", 24f, Color.parseColor("#FF3B30"))
         t1.gravity = Gravity.CENTER
         val t2 = label("Page ${i + 1} of $n", 14f, Color.parseColor("#9E9E9E"))
@@ -778,11 +848,13 @@ class MainActivity : ComponentActivity() {
         bar.orientation = LinearLayout.HORIZONTAL
         bar.gravity = Gravity.CENTER_VERTICAL
         bar.setPadding(dp(16), dp(8), dp(16), dp(20))
-        bar.addView(pill("Back", Color.parseColor("#3A3A3A")) { cropBack() }, lp(dp(110), dp(52)))
-        bar.addView(View(this), lp(0, 1, 1f))
-        bar.addView(iconText("Reset crop", 15f) { cropView?.resetCrop() }, lp(WRAP, WRAP))
-        bar.addView(View(this), lp(0, 1, 1f))
-        bar.addView(pill("Next  \u2192", GREEN) { cropNext() }, lp(dp(130), dp(56)))
+        bar.addView(pill("Back", Color.parseColor("#3A3A3A")) { cropBack() }, lp(0, dp(52), 1f))
+        val reset = label("Reset crop", 15f, Color.WHITE)
+        reset.gravity = Gravity.CENTER
+        reset.setPadding(dp(12), dp(10), dp(12), dp(10))
+        reset.setOnClickListener { cropView?.resetCrop() }
+        bar.addView(reset, lp(WRAP, WRAP))
+        bar.addView(pill("Next  \u2192", GREEN) { cropNext() }, lp(0, dp(56), 1.15f))
         root.addView(bar)
         setContentView(root)
     }
@@ -841,7 +913,6 @@ class MainActivity : ComponentActivity() {
                     toast("Rotate error: $err")
                 } else {
                     val nw = FloatArray(8)
-                    // rotate 90 clockwise: (x, y) -> (1 - y, x); corner order shifts by one
                     fun rot(k: Int, outK: Int) {
                         nw[2 * outK] = 1f - c[2 * k + 1]
                         nw[2 * outK + 1] = c[2 * k]
@@ -911,7 +982,7 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // ---------- Stage 3: file name, Save as PDF / JPG, Share ----------
+    // ---------- Stage 4: ready screen ----------
 
     private fun baseName(): String {
         var n = (nameInput?.text?.toString() ?: scanName).trim()
@@ -923,10 +994,6 @@ class MainActivity : ComponentActivity() {
 
     private fun jpgName(base: String, k: Int, total: Int): String =
         if (total == 1) "$base.jpg" else "${base}_${k + 1}.jpg"
-
-    private fun setStatus(s: String) {
-        statusView?.text = s
-    }
 
     private fun resetAll() {
         for (f in pages) f.delete()
@@ -941,105 +1008,192 @@ class MainActivity : ComponentActivity() {
         File(cacheDir, "share").deleteRecursively()
     }
 
+    private fun infoRow(kind: Int, text: String): View {
+        val g = LinearLayout(this)
+        g.orientation = LinearLayout.HORIZONTAL
+        g.gravity = Gravity.CENTER_VERTICAL
+        g.addView(IconView(this, kind, false, Color.parseColor("#7A889F")), lp(dp(22), dp(22)))
+        val t = label(text, 14f, Color.parseColor("#7A889F"))
+        t.setPadding(dp(8), 0, 0, 0)
+        g.addView(t)
+        return g
+    }
+
+    private fun bigButton(kind: Int, text: String, color: Int, h: Int, size: Float, onClick: () -> Unit): View {
+        val b = LinearLayout(this)
+        b.orientation = LinearLayout.HORIZONTAL
+        b.gravity = Gravity.CENTER
+        b.background = rounded(color, h / 2)
+        b.elevation = dp(8).toFloat()
+        b.outlineSpotShadowColor = color
+        b.outlineAmbientShadowColor = color
+        b.addView(IconView(this, kind, false, Color.WHITE), lp(dp(26), dp(26)))
+        val t = boldLabel(text, size, Color.WHITE)
+        t.setPadding(dp(10), 0, 0, 0)
+        b.addView(t)
+        b.setOnClickListener { onClick() }
+        return b
+    }
+
     private fun showNext() {
         screen = "next"
+        bars(Color.parseColor("#EAF2FF"), true)
         if (scanName.isEmpty()) scanName = "Scan_" + stamp()
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#F3F9FF"))
 
-        val head = LinearLayout(this)
-        head.orientation = LinearLayout.VERTICAL
-        head.setBackgroundColor(BLUE)
-        head.setPadding(dp(24), dp(40), dp(24), dp(18))
-        head.addView(label("PDF is ready", 24f, Color.WHITE))
-        head.addView(label("${edited.size} page(s)", 14f, Color.parseColor("#D6EEFF")))
-        root.addView(head, lp(MATCH, WRAP))
+        val sv = ScrollView(this)
+        sv.isFillViewport = true
+        sv.background = GradientDrawable(
+            GradientDrawable.Orientation.TOP_BOTTOM,
+            intArrayOf(Color.parseColor("#EAF2FF"), Color.WHITE)
+        )
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(24), dp(16), dp(24), dp(24))
 
-        val body = LinearLayout(this)
-        body.orientation = LinearLayout.VERTICAL
-        body.setPadding(dp(20), dp(16), dp(20), dp(16))
+        val back = FrameLayout(this)
+        back.background = rounded(Color.WHITE, 16)
+        back.elevation = dp(4).toFloat()
+        back.addView(IconView(this, 13, false, NAVY, 0.08f), FrameLayout.LayoutParams(dp(48), dp(48)))
+        back.setOnClickListener { leaveFinal() }
+        col.addView(back, lp(dp(48), dp(48)))
+
+        val iconWrap = FrameLayout(this)
+        val tile = FrameLayout(this)
+        val tileBg = rounded(Color.parseColor("#F3F8FF"), 40)
+        tileBg.setStroke(dp(2), Color.parseColor("#E1ECFB"))
+        tile.background = tileBg
+        tile.addView(
+            IconView(this, 7, false, Color.parseColor("#2F6FEB"), 0.085f),
+            FrameLayout.LayoutParams(dp(126), dp(126))
+        )
+        iconWrap.addView(tile, FrameLayout.LayoutParams(dp(126), dp(126), Gravity.TOP or Gravity.START))
+        val chk = FrameLayout(this)
+        val chkBg = oval(Color.parseColor("#00B976"))
+        chkBg.setStroke(dp(4), Color.WHITE)
+        chk.background = chkBg
+        chk.elevation = dp(4).toFloat()
+        chk.addView(
+            IconView(this, 10, false, Color.WHITE, 0.1f),
+            FrameLayout.LayoutParams(dp(50), dp(50))
+        )
+        iconWrap.addView(chk, FrameLayout.LayoutParams(dp(50), dp(50), Gravity.BOTTOM or Gravity.END))
+        val iwl = lp(dp(150), dp(142))
+        iwl.gravity = Gravity.CENTER_HORIZONTAL
+        iwl.topMargin = dp(8)
+        col.addView(iconWrap, iwl)
+
+        val r1 = boldLabel("READY TO SAVE", 13f, Color.parseColor("#2F6FEB"))
+        r1.letterSpacing = 0.15f
+        r1.gravity = Gravity.CENTER
+        r1.setPadding(0, dp(14), 0, dp(4))
+        col.addView(r1, lp(MATCH, WRAP))
+        val r2 = boldLabel("Your scan is ready", 30f, NAVY)
+        r2.gravity = Gravity.CENTER
+        col.addView(r2, lp(MATCH, WRAP))
+        val r3 = label(
+            "Review the name below and save it as PDF or JPG, or share it right away.",
+            16f, GRAY
+        )
+        r3.gravity = Gravity.CENTER
+        r3.setPadding(dp(8), dp(10), dp(8), 0)
+        col.addView(r3, lp(MATCH, WRAP))
 
         val hs = HorizontalScrollView(this)
         hs.isHorizontalScrollBarEnabled = false
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
-        for (p in edited) {
+        row.setPadding(dp(4), dp(6), dp(4), dp(10))
+        for (k in edited.indices) {
+            val cell = FrameLayout(this)
             val iv = ImageView(this)
             iv.scaleType = ImageView.ScaleType.CENTER_CROP
-            iv.setPadding(dp(2), dp(2), dp(2), dp(2))
-            iv.background = rounded(Color.WHITE, 8)
-            iv.setImageBitmap(thumb(p, 300))
-            val l = lp(dp(96), dp(132))
-            l.rightMargin = dp(8)
-            row.addView(iv, l)
+            iv.setPadding(dp(3), dp(3), dp(3), dp(3))
+            iv.background = rounded(Color.WHITE, 20)
+            iv.clipToOutline = true
+            iv.elevation = dp(4).toFloat()
+            iv.setImageBitmap(thumb(edited[k], 300))
+            cell.addView(iv, FrameLayout.LayoutParams(dp(104), dp(136)))
+            val nb = boldLabel((k + 1).toString(), 12f, Color.WHITE)
+            nb.gravity = Gravity.CENTER
+            nb.background = oval(Color.parseColor("#0B4F6C"))
+            val nbl = FrameLayout.LayoutParams(dp(24), dp(24), Gravity.BOTTOM or Gravity.START)
+            nbl.leftMargin = dp(10)
+            nbl.bottomMargin = dp(10)
+            cell.addView(nb, nbl)
+            val cl = lp(dp(104), dp(136))
+            cl.rightMargin = dp(12)
+            row.addView(cell, cl)
         }
         hs.addView(row)
-        body.addView(hs)
+        val hl = lp(MATCH, WRAP)
+        hl.topMargin = dp(22)
+        col.addView(hs, hl)
 
-        val nl = label("File name", 13f, Color.parseColor("#455A64"))
-        nl.setPadding(0, dp(18), 0, dp(6))
-        body.addView(nl)
+        val fl = boldLabel("File name", 14f, Color.parseColor("#8793A8"))
+        fl.setPadding(dp(4), dp(18), 0, dp(8))
+        col.addView(fl, lp(MATCH, WRAP))
 
+        val inputWrap = FrameLayout(this)
         val et = EditText(this)
         et.setText(scanName)
         et.setSingleLine(true)
-        et.textSize = 16f
-        et.setTextColor(Color.parseColor("#01579B"))
-        et.setPadding(dp(14), dp(12), dp(14), dp(12))
-        et.background = rounded(Color.WHITE, 12)
+        et.textSize = 18f
+        et.setTypeface(null, Typeface.BOLD)
+        et.setTextColor(Color.parseColor("#1A2340"))
+        et.setPadding(dp(22), 0, dp(56), 0)
+        val etBg = rounded(Color.parseColor("#F4F8FF"), 29)
+        etBg.setStroke(dp(2), Color.parseColor("#D3E4FA"))
+        et.background = etBg
         nameInput = et
-        body.addView(et, lp(MATCH, WRAP))
+        inputWrap.addView(et, FrameLayout.LayoutParams(MATCH, dp(58)))
+        val clr = IconView(this, 14, false, Color.parseColor("#9AA7BC"))
+        clr.setOnClickListener { et.setText("") }
+        val cll = FrameLayout.LayoutParams(dp(34), dp(34), Gravity.END or Gravity.CENTER_VERTICAL)
+        cll.rightMargin = dp(14)
+        inputWrap.addView(clr, cll)
+        col.addView(inputWrap, lp(MATCH, WRAP))
 
-        val acts = LinearLayout(this)
-        acts.orientation = LinearLayout.HORIZONTAL
-        val a1 = lp(0, dp(58), 1f)
-        a1.rightMargin = dp(6)
-        acts.addView(pill("Save as PDF", GREEN) { doSave(true) }, a1)
-        val a2 = lp(0, dp(58), 1f)
-        a2.leftMargin = dp(6)
-        acts.addView(pill("Save as JPG", BLUE) { doSave(false) }, a2)
-        val alp = lp(MATCH, WRAP)
-        alp.topMargin = dp(22)
-        body.addView(acts, alp)
+        val info = LinearLayout(this)
+        info.orientation = LinearLayout.HORIZONTAL
+        info.setPadding(dp(6), dp(14), dp(6), 0)
+        val cnt = if (edited.size == 1) "1 scanned page" else "${edited.size} scanned pages"
+        info.addView(infoRow(7, cnt))
+        info.addView(View(this), lp(0, 1, 1f))
+        info.addView(infoRow(12, "Saved on device"))
+        col.addView(info, lp(MATCH, WRAP))
 
-        val share = TextView(this)
-        share.text = "Share"
-        share.textSize = 17f
-        share.setTextColor(BLUE)
-        share.setTypeface(null, Typeface.BOLD)
-        share.gravity = Gravity.CENTER
-        val sd = GradientDrawable()
-        sd.cornerRadius = dp(28).toFloat()
-        sd.setColor(Color.WHITE)
-        sd.setStroke(dp(2), BLUE)
-        share.background = sd
-        share.setOnClickListener { askShare() }
-        val slp = lp(MATCH, dp(58))
-        slp.topMargin = dp(12)
-        body.addView(share, slp)
+        val savePdf = bigButton(6, "Save as PDF", Color.parseColor("#1B5BFF"), 64, 20f) { doSave(true) }
+        val spl = lp(MATCH, dp(64))
+        spl.topMargin = dp(28)
+        col.addView(savePdf, spl)
 
-        val st = label("Tap Save as PDF or Save as JPG to save on your phone.", 13f, Color.parseColor("#455A64"))
-        st.setPadding(0, dp(14), 0, 0)
-        statusView = st
-        body.addView(st)
+        val two = LinearLayout(this)
+        two.orientation = LinearLayout.HORIZONTAL
+        val jpg = bigButton(2, "Save as JPG", Color.parseColor("#FFB800"), 60, 17f) { doSave(false) }
+        val jl = lp(0, dp(60), 1f)
+        jl.rightMargin = dp(8)
+        two.addView(jpg, jl)
+        val shr = bigButton(8, "Share", Color.parseColor("#00B976"), 60, 17f) { showShareSheet() }
+        val sl = lp(0, dp(60), 1f)
+        sl.leftMargin = dp(8)
+        two.addView(shr, sl)
+        val tl = lp(MATCH, WRAP)
+        tl.topMargin = dp(18)
+        col.addView(two, tl)
 
-        val sv = ScrollView(this)
-        sv.addView(body)
-        root.addView(sv, lp(MATCH, 0, 1f))
-
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.gravity = Gravity.CENTER_VERTICAL
-        bar.setPadding(dp(16), dp(8), dp(16), dp(20))
-        bar.addView(pill("Back", Color.parseColor("#78909C")) { leaveFinal() }, lp(dp(96), dp(52)))
-        bar.addView(View(this), lp(0, 1, 1f))
-        bar.addView(pill("Done", BLUE) {
+        val home = boldLabel("Home", 18f, GRAY)
+        home.gravity = Gravity.CENTER
+        home.setPadding(0, dp(18), 0, dp(18))
+        home.setOnClickListener {
             resetAll()
             showHome()
-        }, lp(dp(110), dp(52)))
-        root.addView(bar)
-        setContentView(root)
+        }
+        val hml = lp(MATCH, WRAP)
+        hml.topMargin = dp(12)
+        col.addView(home, hml)
+
+        sv.addView(col)
+        setContentView(sv)
     }
 
     private fun leaveFinal() {
@@ -1047,11 +1201,96 @@ class MainActivity : ComponentActivity() {
         if (pages.isEmpty()) showCamera() else showCrop(pages.size - 1)
     }
 
-    private fun askShare() {
-        AlertDialog.Builder(this)
-            .setTitle("Share as")
-            .setItems(arrayOf("PDF", "JPG")) { _, which -> doShare(which == 0) }
-            .show()
+    private fun formatCard(
+        kind: Int, text: String, bgColor: Int, border: Int, tileColor: Int, glyph: Int, onClick: () -> Unit
+    ): View {
+        val c = LinearLayout(this)
+        c.orientation = LinearLayout.VERTICAL
+        c.gravity = Gravity.CENTER_HORIZONTAL
+        c.setPadding(dp(12), dp(24), dp(12), dp(22))
+        val d = GradientDrawable()
+        d.setColor(bgColor)
+        d.cornerRadius = dp(30).toFloat()
+        d.setStroke(dp(3), border)
+        c.background = d
+        val tile = FrameLayout(this)
+        tile.background = rounded(tileColor, 22)
+        tile.addView(IconView(this, kind, false, glyph, 0.07f), FrameLayout.LayoutParams(dp(56), dp(56)))
+        c.addView(tile, lp(dp(56), dp(56)))
+        val t = boldLabel(text, 26f, NAVY)
+        t.gravity = Gravity.CENTER
+        t.setPadding(0, dp(14), 0, 0)
+        c.addView(t, lp(MATCH, WRAP))
+        c.setOnClickListener { onClick() }
+        return c
+    }
+
+    private fun showShareSheet() {
+        val dlg = Dialog(this)
+        dlg.requestWindowFeature(Window.FEATURE_NO_TITLE)
+        val sheet = LinearLayout(this)
+        sheet.orientation = LinearLayout.VERTICAL
+        sheet.gravity = Gravity.CENTER_HORIZONTAL
+        sheet.setPadding(dp(20), dp(12), dp(20), dp(28))
+        val bg = GradientDrawable()
+        bg.setColor(Color.WHITE)
+        val r = dp(36).toFloat()
+        bg.cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+        sheet.background = bg
+
+        val handle = View(this)
+        handle.background = rounded(Color.parseColor("#DDE3EE"), 3)
+        sheet.addView(handle, lp(dp(56), dp(6)))
+
+        val t = boldLabel("Share as", 32f, NAVY)
+        t.gravity = Gravity.CENTER
+        t.setPadding(0, dp(24), 0, dp(4))
+        sheet.addView(t, lp(MATCH, WRAP))
+        val s = label("Choose the format you want to send", 17f, GRAY)
+        s.gravity = Gravity.CENTER
+        sheet.addView(s, lp(MATCH, WRAP))
+
+        val cards = LinearLayout(this)
+        cards.orientation = LinearLayout.HORIZONTAL
+        val pdfCardView = formatCard(
+            7, "PDF", Color.parseColor("#EEF6FF"), Color.parseColor("#D7E9FB"),
+            Color.parseColor("#2680EB"), Color.WHITE
+        ) {
+            dlg.dismiss()
+            doShare(true)
+        }
+        val c1 = lp(0, WRAP, 1f)
+        c1.rightMargin = dp(8)
+        cards.addView(pdfCardView, c1)
+        val jpgCardView = formatCard(
+            2, "JPG", Color.parseColor("#FFF9E6"), Color.parseColor("#FCEFC0"),
+            Color.parseColor("#FFB800"), Color.parseColor("#1A1A1A")
+        ) {
+            dlg.dismiss()
+            doShare(false)
+        }
+        val c2 = lp(0, WRAP, 1f)
+        c2.leftMargin = dp(8)
+        cards.addView(jpgCardView, c2)
+        val cl = lp(MATCH, WRAP)
+        cl.topMargin = dp(24)
+        sheet.addView(cards, cl)
+
+        val cancel = boldLabel("Cancel", 22f, GRAY)
+        cancel.gravity = Gravity.CENTER
+        cancel.setPadding(0, dp(22), 0, dp(10))
+        cancel.setOnClickListener { dlg.dismiss() }
+        sheet.addView(cancel, lp(MATCH, WRAP))
+
+        dlg.setContentView(sheet)
+        val w = dlg.window
+        if (w != null) {
+            w.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
+            w.setLayout(WindowManager.LayoutParams.MATCH_PARENT, WindowManager.LayoutParams.WRAP_CONTENT)
+            w.setGravity(Gravity.BOTTOM)
+            w.setDimAmount(0.5f)
+        }
+        dlg.show()
     }
 
     private fun doShare(asPdf: Boolean) {
@@ -1060,7 +1299,7 @@ class MainActivity : ComponentActivity() {
         val base = baseName()
         scanName = base
         val files = edited.toList()
-        setStatus("Preparing to share...")
+        toast("Preparing to share...")
         worker.execute {
             var uris: ArrayList<Uri>? = null
             var err: Throwable? = null
@@ -1089,10 +1328,8 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 busy = false
                 if (er != null || res == null) {
-                    setStatus("Share error: $er")
                     toast("Share error: $er")
                 } else {
-                    setStatus("")
                     try {
                         val i: Intent
                         if (res.size == 1) {
@@ -1119,7 +1356,7 @@ class MainActivity : ComponentActivity() {
         val base = baseName()
         scanName = base
         val files = edited.toList()
-        setStatus("Saving...")
+        toast("Saving...")
         worker.execute {
             var msg = ""
             var err: Throwable? = null
@@ -1162,18 +1399,12 @@ class MainActivity : ComponentActivity() {
             val ok = msg
             runOnUiThread {
                 busy = false
-                if (er != null) {
-                    setStatus("Save error: $er")
-                    toast("Save error: $er")
-                } else {
-                    setStatus(ok)
-                    toast(ok)
-                }
+                if (er != null) toast("Save error: $er") else toast(ok)
             }
         }
     }
 
-    // ---------- Additional stage: Home, Import PDF, All PDFs ----------
+    // ---------- Stage 1: Home / Import / All PDFs ----------
 
     private fun loadPdfs(): List<PdfItem> {
         val list = ArrayList<PdfItem>()
@@ -1209,16 +1440,6 @@ class MainActivity : ComponentActivity() {
         return list
     }
 
-    private fun fmtMeta(p: PdfItem): String {
-        val date = SimpleDateFormat("dd MMM yyyy", Locale.getDefault()).format(Date(p.dateSec * 1000L))
-        val size = if (p.size >= 1048576L) {
-            String.format(Locale.US, "%.1f MB", p.size / 1048576.0)
-        } else {
-            "${maxOf(1L, p.size / 1024L)} KB"
-        }
-        return "$date  \u00B7  $size"
-    }
-
     private fun openPdf(uri: Uri) {
         try {
             val i = Intent(Intent.ACTION_VIEW)
@@ -1228,6 +1449,37 @@ class MainActivity : ComponentActivity() {
         } catch (e: Throwable) {
             toast("No PDF viewer found on this phone")
         }
+    }
+
+    private fun sharePdfUri(uri: Uri) {
+        try {
+            val i = Intent(Intent.ACTION_SEND)
+            i.type = "application/pdf"
+            i.putExtra(Intent.EXTRA_STREAM, uri)
+            i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(i, "Share"))
+        } catch (e: Throwable) {
+            toast("Share error: $e")
+        }
+    }
+
+    private fun confirmDeletePdf(p: PdfItem) {
+        val dlg = AlertDialog.Builder(this)
+            .setMessage("Do you want to delete this PDF?")
+            .setPositiveButton("Yes") { _, _ ->
+                try {
+                    contentResolver.delete(p.uri, null, null)
+                    thumbCache.remove(p.uri.toString())
+                } catch (e: Throwable) {
+                    toast("Could not delete this file")
+                }
+                if (screen == "all") showAll() else showHome()
+            }
+            .setNegativeButton("No", null)
+            .create()
+        dlg.show()
+        dlg.getButton(DialogInterface.BUTTON_POSITIVE).setTextColor(BLUE)
+        dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setTextColor(BLUE)
     }
 
     private fun importPdf(uri: Uri) {
@@ -1273,91 +1525,189 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun gradientHeader(): GradientDrawable {
-        val g = GradientDrawable(
-            GradientDrawable.Orientation.LEFT_RIGHT,
-            intArrayOf(Color.parseColor("#FF5A36"), Color.parseColor("#D81B7A"))
+    private fun loadThumb(p: PdfItem, iv: ImageView, meta: TextView, dateStr: String) {
+        val key = p.uri.toString()
+        val cached = thumbCache[key]
+        if (cached != null) {
+            iv.setImageBitmap(cached)
+            val pc = pageCountCache[key] ?: 1
+            meta.text = (if (pc == 1) "1 page" else "$pc pages") + " \u2022 " + dateStr
+            return
+        }
+        thumbPool.execute {
+            var bmp: Bitmap? = null
+            var pc = 0
+            try {
+                val pfd = contentResolver.openFileDescriptor(p.uri, "r")
+                if (pfd != null) {
+                    val r = PdfRenderer(pfd)
+                    pc = r.pageCount
+                    if (pc > 0) {
+                        val page = r.openPage(0)
+                        val w = 200
+                        val h = maxOf(1, (w.toFloat() * page.height / page.width).toInt())
+                        val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                        b.eraseColor(Color.WHITE)
+                        page.render(b, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                        page.close()
+                        bmp = b
+                    }
+                    r.close()
+                    pfd.close()
+                }
+            } catch (e: Throwable) {
+            }
+            val fb = bmp
+            val fc = pc
+            runOnUiThread {
+                if (fb != null) {
+                    thumbCache[key] = fb
+                    iv.setImageBitmap(fb)
+                }
+                if (fc > 0) {
+                    pageCountCache[key] = fc
+                    meta.text = (if (fc == 1) "1 page" else "$fc pages") + " \u2022 " + dateStr
+                }
+            }
+        }
+    }
+
+    private fun pdfCard(p: PdfItem): View {
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.HORIZONTAL
+        card.gravity = Gravity.CENTER_VERTICAL
+        card.setPadding(dp(14), dp(14), dp(14), dp(14))
+        card.background = rounded(Color.WHITE, 28)
+        card.elevation = dp(4).toFloat()
+        val cl = lp(MATCH, WRAP)
+        cl.topMargin = dp(14)
+        card.layoutParams = cl
+
+        val iv = ImageView(this)
+        iv.scaleType = ImageView.ScaleType.CENTER_CROP
+        iv.background = rounded(Color.parseColor("#E2E8F0"), 16)
+        iv.clipToOutline = true
+        card.addView(iv, lp(dp(64), dp(64)))
+
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.setPadding(dp(14), 0, dp(8), 0)
+        val title = p.name.replace(Regex("\\.pdf$", RegexOption.IGNORE_CASE), "")
+        val nm = boldLabel(title, 19f, NAVY)
+        nm.maxLines = 1
+        nm.ellipsize = TextUtils.TruncateAt.END
+        col.addView(nm, lp(MATCH, WRAP))
+        val dateStr = SimpleDateFormat("dd/MM/yyyy, HH:mm:ss", Locale.getDefault())
+            .format(Date(p.dateSec * 1000L))
+        val meta = label(dateStr, 14f, Color.parseColor("#6B7C93"))
+        col.addView(meta, lp(MATCH, WRAP))
+        card.addView(col, lp(0, WRAP, 1f))
+
+        card.addView(
+            squareBtn(6, Color.parseColor("#00A6F0"), Color.WHITE) { sharePdfUri(p.uri) },
+            lp(dp(52), dp(52))
         )
-        val r = dp(36).toFloat()
+        val tl = lp(dp(52), dp(52))
+        tl.leftMargin = dp(10)
+        card.addView(
+            squareBtn(0, Color.parseColor("#EEF1F6"), Color.parseColor("#8A97AB")) { confirmDeletePdf(p) },
+            tl
+        )
+        card.setOnClickListener { openPdf(p.uri) }
+        loadThumb(p, iv, meta, dateStr)
+        return card
+    }
+
+    private fun headerBg(): GradientDrawable {
+        val g = GradientDrawable(
+            GradientDrawable.Orientation.TL_BR,
+            intArrayOf(Color.parseColor("#00B8FF"), Color.parseColor("#2F7BFF"), Color.parseColor("#5B4BF2"))
+        )
+        val r = dp(48).toFloat()
         g.cornerRadii = floatArrayOf(0f, 0f, 0f, 0f, r, r, r, r)
         return g
     }
 
-    private fun navItem(kind: Int, text: String, sel: Boolean, onClick: () -> Unit): View {
-        val wrap = FrameLayout(this)
+    private fun segItem(kind: Int, text: String, sel: Boolean, onClick: () -> Unit): View {
         val item = LinearLayout(this)
         item.orientation = LinearLayout.HORIZONTAL
-        item.gravity = Gravity.CENTER_VERTICAL
-        item.setPadding(dp(18), dp(10), dp(20), dp(10))
-        if (sel) item.background = rounded(Color.parseColor("#FFD9D6"), 24)
-        val col = if (sel) PINK else GRAY
-        item.addView(IconView(this, kind, false, col), lp(dp(26), dp(26)))
-        val t = boldLabel(text, 15f, col)
-        t.setPadding(dp(8), 0, 0, 0)
+        item.gravity = Gravity.CENTER
+        if (sel) item.background = rounded(Color.parseColor("#00A6F0"), 24)
+        val col = if (sel) Color.WHITE else Color.parseColor("#6B7C93")
+        item.addView(IconView(this, kind, false, col), lp(dp(24), dp(24)))
+        val t = boldLabel(text, 18f, col)
+        t.setPadding(dp(10), 0, 0, 0)
         item.addView(t)
         item.setOnClickListener { onClick() }
-        wrap.addView(item, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.CENTER))
-        return wrap
+        return item
     }
 
-    private fun navBar(selected: Int): View {
-        val bar = LinearLayout(this)
-        bar.orientation = LinearLayout.HORIZONTAL
-        bar.setBackgroundColor(Color.parseColor("#FCEAE9"))
-        bar.setPadding(dp(12), dp(10), dp(12), dp(14))
-        bar.addView(navItem(5, "Home", selected == 0) { if (screen != "home") showHome() }, lp(0, WRAP, 1f))
-        bar.addView(navItem(6, "Import PDF", selected == 1) { if (screen != "import") showImport() }, lp(0, WRAP, 1f))
-        return bar
+    private fun blueHeader(selected: Int): View {
+        val head = LinearLayout(this)
+        head.orientation = LinearLayout.VERTICAL
+        head.background = headerBg()
+        head.setPadding(dp(24), dp(28), dp(24), dp(28))
+
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        val tile = FrameLayout(this)
+        tile.background = rounded(Color.parseColor("#40FFFFFF"), 20)
+        tile.addView(IconView(this, 3, false, Color.WHITE), FrameLayout.LayoutParams(dp(56), dp(56)))
+        top.addView(tile, lp(dp(56), dp(56)))
+        val tc = LinearLayout(this)
+        tc.orientation = LinearLayout.VERTICAL
+        tc.setPadding(dp(18), 0, 0, 0)
+        tc.addView(boldLabel("Scan", 34f, Color.WHITE))
+        tc.addView(label("Turn documents into PDF \u2013 instantly", 14f, Color.parseColor("#E6F0FF")))
+        top.addView(tc, lp(0, WRAP, 1f))
+        head.addView(top, lp(MATCH, WRAP))
+
+        val seg = LinearLayout(this)
+        seg.orientation = LinearLayout.HORIZONTAL
+        seg.setPadding(dp(6), dp(6), dp(6), dp(6))
+        seg.background = rounded(Color.WHITE, 32)
+        seg.elevation = dp(8).toFloat()
+        seg.addView(segItem(5, "Home", selected == 0) { if (screen != "home") showHome() }, lp(0, dp(48), 1f))
+        seg.addView(segItem(6, "Import", selected == 1) { if (screen != "import") showImport() }, lp(0, dp(48), 1f))
+        val sl = lp(MATCH, WRAP)
+        sl.topMargin = dp(22)
+        head.addView(seg, sl)
+        return head
     }
 
-    private fun homeCard(
-        kind: Int, title: String, sub: String, tileBg: Int, glyph: Int, onClick: () -> Unit
+    private fun bigCard(
+        kind: Int, title: String, sub: String, c1: Int, c2: Int, shadow: Int, onClick: () -> Unit
     ): View {
-        val card = LinearLayout(this)
-        card.orientation = LinearLayout.VERTICAL
-        card.setPadding(dp(18), dp(18), dp(18), dp(16))
-        card.background = rounded(Color.WHITE, 28)
-        card.elevation = dp(6).toFloat()
-        val tile = FrameLayout(this)
-        tile.background = rounded(tileBg, 22)
-        tile.addView(IconView(this, kind, false, glyph), FrameLayout.LayoutParams(dp(68), dp(68)))
-        card.addView(tile, lp(dp(68), dp(68)))
-        card.addView(View(this), lp(1, 0, 1f))
-        card.addView(boldLabel(title, 24f, NAVY))
-        val sr = LinearLayout(this)
-        sr.orientation = LinearLayout.HORIZONTAL
-        sr.gravity = Gravity.CENTER_VERTICAL
-        sr.addView(label(sub, 15f, GRAY), lp(0, WRAP, 1f))
-        sr.addView(label("\u2192", 20f, GRAY))
-        card.addView(sr, lp(MATCH, WRAP))
-        card.setOnClickListener { onClick() }
-        return card
-    }
+        val card = FrameLayout(this)
+        val bg = GradientDrawable(GradientDrawable.Orientation.TL_BR, intArrayOf(c1, c2))
+        bg.cornerRadius = dp(36).toFloat()
+        card.background = bg
+        card.clipToOutline = true
+        card.elevation = dp(10).toFloat()
+        card.outlineSpotShadowColor = shadow
+        card.outlineAmbientShadowColor = shadow
 
-    private fun pdfRow(p: PdfItem): View {
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.gravity = Gravity.CENTER_VERTICAL
-        row.setPadding(dp(12), dp(12), dp(12), dp(12))
-        row.background = rounded(Color.WHITE, 16)
-        val lpRow = lp(MATCH, WRAP)
-        lpRow.topMargin = dp(10)
-        row.layoutParams = lpRow
-        val tile = FrameLayout(this)
-        tile.background = rounded(Color.parseColor("#FDECEA"), 14)
-        tile.addView(IconView(this, 7, false, PINK), FrameLayout.LayoutParams(dp(48), dp(48)))
-        row.addView(tile, lp(dp(48), dp(48)))
+        val deco = View(this)
+        deco.background = oval(Color.parseColor("#22FFFFFF"))
+        val dl = FrameLayout.LayoutParams(dp(150), dp(150), Gravity.BOTTOM or Gravity.END)
+        dl.rightMargin = -dp(50)
+        dl.bottomMargin = -dp(60)
+        card.addView(deco, dl)
+
         val col = LinearLayout(this)
         col.orientation = LinearLayout.VERTICAL
-        col.setPadding(dp(12), 0, 0, 0)
-        val nm = boldLabel(p.name, 15f, NAVY)
-        nm.maxLines = 1
-        nm.ellipsize = TextUtils.TruncateAt.END
-        col.addView(nm, lp(MATCH, WRAP))
-        col.addView(label(fmtMeta(p), 12f, GRAY), lp(MATCH, WRAP))
-        row.addView(col, lp(0, WRAP, 1f))
-        row.setOnClickListener { openPdf(p.uri) }
-        return row
+        col.setPadding(dp(20), dp(20), dp(16), dp(22))
+        val tile = FrameLayout(this)
+        tile.background = rounded(Color.parseColor("#40FFFFFF"), 22)
+        tile.addView(IconView(this, kind, false, Color.WHITE), FrameLayout.LayoutParams(dp(64), dp(64)))
+        col.addView(tile, lp(dp(64), dp(64)))
+        col.addView(View(this), lp(1, 0, 1f))
+        col.addView(boldLabel(title, 28f, Color.WHITE))
+        col.addView(label(sub, 16f, Color.parseColor("#F0F6FF")))
+        card.addView(col, FrameLayout.LayoutParams(MATCH, MATCH))
+        card.setOnClickListener { onClick() }
+        return card
     }
 
     private fun startScanMode(id: Boolean) {
@@ -1368,86 +1718,43 @@ class MainActivity : ComponentActivity() {
 
     private fun showHome() {
         screen = "home"
+        bars(Color.parseColor("#07B3FF"), false)
         val pdfs = loadPdfs()
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#FAFAFC"))
-
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
-
-        val head = LinearLayout(this)
-        head.orientation = LinearLayout.VERTICAL
-        head.background = gradientHeader()
-        head.setPadding(dp(24), dp(52), dp(24), dp(96))
-        head.addView(label("Welcome Back", 16f, Color.parseColor("#FFE3E3")))
-        head.addView(boldLabel("Kagaz Scan \uD83D\uDCD6", 34f, Color.WHITE))
-        content.addView(head, lp(MATCH, WRAP))
+        content.addView(blueHeader(0), lp(MATCH, WRAP))
 
         val cards = LinearLayout(this)
         cards.orientation = LinearLayout.HORIZONTAL
-        cards.setPadding(dp(20), 0, dp(20), 0)
-        val c1 = lp(0, dp(176), 1f)
+        cards.setPadding(dp(24), dp(28), dp(24), dp(10))
+        cards.clipChildren = false
+        cards.clipToPadding = false
+        val c1 = lp(0, dp(220), 1f)
         c1.rightMargin = dp(8)
         cards.addView(
-            homeCard(3, "Scan", "Documents", Color.parseColor("#E3F2FD"), Color.parseColor("#1E88E5")) {
-                startScanMode(false)
-            }, c1
+            bigCard(
+                3, "Scan", "Document from camera",
+                Color.parseColor("#3C8CFF"), Color.parseColor("#1B5BFF"), Color.parseColor("#3C8CFF")
+            ) { startScanMode(false) }, c1
         )
-        val c2 = lp(0, dp(176), 1f)
+        val c2 = lp(0, dp(220), 1f)
         c2.leftMargin = dp(8)
         cards.addView(
-            homeCard(4, "ID Card", "Front & back", Color.parseColor("#FFF3CD"), Color.parseColor("#F9A825")) {
-                startScanMode(true)
-            }, c2
+            bigCard(
+                4, "ID Card", "Front + Back on one page",
+                Color.parseColor("#FFB400"), Color.parseColor("#FF7A00"), Color.parseColor("#FF9A00")
+            ) { startScanMode(true) }, c2
         )
-        val cl = lp(MATCH, WRAP)
-        cl.topMargin = -dp(70)
-        content.addView(cards, cl)
-
-        val tip = LinearLayout(this)
-        tip.orientation = LinearLayout.HORIZONTAL
-        tip.gravity = Gravity.CENTER_VERTICAL
-        tip.setPadding(dp(16), dp(16), dp(16), dp(16))
-        val tipBg = GradientDrawable()
-        tipBg.cornerRadius = dp(22).toFloat()
-        tipBg.setColor(Color.parseColor("#E6F2FD"))
-        tipBg.setStroke(dp(2), Color.parseColor("#BBDDF7"))
-        tip.background = tipBg
-        val plus = TextView(this)
-        plus.text = "+"
-        plus.textSize = 26f
-        plus.setTextColor(Color.WHITE)
-        plus.gravity = Gravity.CENTER
-        plus.background = oval(Color.parseColor("#1E88E5"))
-        tip.addView(plus, lp(dp(46), dp(46)))
-        val tc = LinearLayout(this)
-        tc.orientation = LinearLayout.VERTICAL
-        tc.setPadding(dp(14), 0, 0, 0)
-        tc.addView(boldLabel("Quick tip", 17f, Color.parseColor("#1565C0")))
-        tc.addView(
-            label(
-                "Hold your phone steady. Auto scan captures the page when it is aligned.",
-                14f, Color.parseColor("#1976D2")
-            )
-        )
-        tip.addView(tc, lp(0, WRAP, 1f))
-        val tlp = lp(MATCH, WRAP)
-        tlp.setMargins(dp(20), dp(20), dp(20), 0)
-        content.addView(tip, tlp)
+        content.addView(cards, lp(MATCH, WRAP))
 
         val sec = LinearLayout(this)
         sec.orientation = LinearLayout.VERTICAL
-        sec.setPadding(dp(20), dp(24), dp(20), dp(16))
-        val lib = label("YOUR LIBRARY", 12f, GRAY)
-        lib.letterSpacing = 0.15f
-        lib.setTypeface(null, Typeface.BOLD)
-        sec.addView(lib)
+        sec.setPadding(dp(24), dp(20), dp(24), dp(24))
         val hr = LinearLayout(this)
         hr.orientation = LinearLayout.HORIZONTAL
-        hr.gravity = Gravity.BOTTOM
-        hr.addView(boldLabel("Recent PDFs", 26f, NAVY), lp(0, WRAP, 1f))
-        val seeAll = boldLabel("See all", 16f, Color.parseColor("#1E88E5"))
+        hr.gravity = Gravity.CENTER_VERTICAL
+        hr.addView(boldLabel("Recent PDFs", 28f, Color.parseColor("#1B2540")), lp(0, WRAP, 1f))
+        val seeAll = boldLabel("See all", 17f, Color.parseColor("#1E88E5"))
         seeAll.setPadding(dp(8), dp(8), 0, dp(8))
         seeAll.setOnClickListener { showAll() }
         hr.addView(seeAll)
@@ -1455,33 +1762,25 @@ class MainActivity : ComponentActivity() {
         if (pdfs.isEmpty()) {
             val e = label("No scans yet", 16f, Color.parseColor("#9CA3AF"))
             e.gravity = Gravity.CENTER
-            e.setPadding(0, dp(40), 0, dp(40))
+            e.setPadding(0, dp(36), 0, dp(36))
             sec.addView(e, lp(MATCH, WRAP))
         } else {
-            for (p in pdfs.take(5)) sec.addView(pdfRow(p))
+            for (p in pdfs.take(5)) sec.addView(pdfCard(p))
         }
         content.addView(sec, lp(MATCH, WRAP))
 
         val sv = ScrollView(this)
+        sv.setBackgroundColor(Color.parseColor("#F6F8FD"))
         sv.addView(content)
-        root.addView(sv, lp(MATCH, 0, 1f))
-        root.addView(navBar(0), lp(MATCH, WRAP))
-        setContentView(root)
+        setContentView(sv)
     }
 
     private fun showImport() {
         screen = "import"
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#FAFAFC"))
-
-        val head = LinearLayout(this)
-        head.orientation = LinearLayout.VERTICAL
-        head.background = gradientHeader()
-        head.setPadding(dp(24), dp(52), dp(24), dp(40))
-        head.addView(boldLabel("Import PDF", 32f, Color.WHITE))
-        head.addView(label("Add an existing PDF to your library", 15f, Color.parseColor("#FFE3E3")))
-        root.addView(head, lp(MATCH, WRAP))
+        bars(Color.parseColor("#07B3FF"), false)
+        val content = LinearLayout(this)
+        content.orientation = LinearLayout.VERTICAL
+        content.addView(blueHeader(1), lp(MATCH, WRAP))
 
         val card = LinearLayout(this)
         card.orientation = LinearLayout.VERTICAL
@@ -1490,8 +1789,11 @@ class MainActivity : ComponentActivity() {
         card.background = rounded(Color.WHITE, 28)
         card.elevation = dp(4).toFloat()
         val tile = FrameLayout(this)
-        tile.background = rounded(Color.parseColor("#FDECEA"), 24)
-        tile.addView(IconView(this, 7, false, PINK), FrameLayout.LayoutParams(dp(84), dp(84)))
+        tile.background = rounded(Color.parseColor("#E3F2FD"), 24)
+        tile.addView(
+            IconView(this, 7, false, Color.parseColor("#1E88E5")),
+            FrameLayout.LayoutParams(dp(84), dp(84))
+        )
         card.addView(tile, lp(dp(84), dp(84)))
         val t = boldLabel("Choose a PDF from your phone", 18f, NAVY)
         t.gravity = Gravity.CENTER
@@ -1500,44 +1802,46 @@ class MainActivity : ComponentActivity() {
         val s = label("Imported files appear in Recent PDFs.", 14f, GRAY)
         s.gravity = Gravity.CENTER
         card.addView(s, lp(MATCH, WRAP))
-        val b = pill("Choose PDF", BLUE) { pdfPicker.launch(arrayOf("application/pdf")) }
+        val b = pill("Choose PDF", Color.parseColor("#00A6F0")) { pdfPicker.launch(arrayOf("application/pdf")) }
         val bl = lp(MATCH, dp(56))
         bl.topMargin = dp(22)
         card.addView(b, bl)
         val cl = lp(MATCH, WRAP)
-        cl.setMargins(dp(20), dp(24), dp(20), 0)
-        root.addView(card, cl)
+        cl.setMargins(dp(24), dp(28), dp(24), 0)
+        content.addView(card, cl)
 
-        root.addView(View(this), lp(1, 0, 1f))
-        root.addView(navBar(1), lp(MATCH, WRAP))
-        setContentView(root)
+        val sv = ScrollView(this)
+        sv.setBackgroundColor(Color.parseColor("#F6F8FD"))
+        sv.addView(content)
+        setContentView(sv)
     }
 
     private fun showAll() {
         screen = "all"
+        bars(Color.parseColor("#07B3FF"), false)
         val pdfs = loadPdfs()
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#FAFAFC"))
+        root.setBackgroundColor(Color.parseColor("#F6F8FD"))
 
         val head = LinearLayout(this)
         head.orientation = LinearLayout.VERTICAL
-        head.background = gradientHeader()
-        head.setPadding(dp(24), dp(52), dp(24), dp(28))
+        head.background = headerBg()
+        head.setPadding(dp(24), dp(28), dp(24), dp(28))
         head.addView(boldLabel("All PDFs", 30f, Color.WHITE))
-        head.addView(label("${pdfs.size} file(s)", 15f, Color.parseColor("#FFE3E3")))
+        head.addView(label("${pdfs.size} file(s)", 15f, Color.parseColor("#E6F0FF")))
         root.addView(head, lp(MATCH, WRAP))
 
         val list = LinearLayout(this)
         list.orientation = LinearLayout.VERTICAL
-        list.setPadding(dp(20), dp(6), dp(20), dp(16))
+        list.setPadding(dp(24), dp(6), dp(24), dp(16))
         if (pdfs.isEmpty()) {
             val e = label("No scans yet", 16f, Color.parseColor("#9CA3AF"))
             e.gravity = Gravity.CENTER
             e.setPadding(0, dp(60), 0, dp(60))
             list.addView(e, lp(MATCH, WRAP))
         } else {
-            for (p in pdfs) list.addView(pdfRow(p))
+            for (p in pdfs) list.addView(pdfCard(p))
         }
         val sv = ScrollView(this)
         sv.addView(list)
@@ -1550,7 +1854,7 @@ class MainActivity : ComponentActivity() {
         setContentView(root)
     }
 
-    // ---------- Stage 1: camera screen ----------
+    // ---------- Stage 2: camera screen ----------
 
     private fun leaveCamera() {
         stopCamera()
@@ -1560,50 +1864,57 @@ class MainActivity : ComponentActivity() {
 
     private fun showCamera() {
         screen = "camera"
-        armed = true
-        lastQuad = null
-        capturedQuad = null
-        stableSince = 0L
-        invalidCount = 0
+        bars(DARK, false)
+        resetAutoState()
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(DARK)
 
-        val top = FrameLayout(this)
-        top.setPadding(dp(8), dp(24), dp(8), dp(4))
-        top.addView(
-            iconText("X", 22f) { leaveCamera() },
-            FrameLayout.LayoutParams(WRAP, WRAP, Gravity.START or Gravity.CENTER_VERTICAL)
-        )
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        top.setPadding(dp(14), dp(12), dp(14), dp(10))
+        top.addView(circleBtn(14) { leaveCamera() }, lp(dp(44), dp(44)))
 
-        val chip = TextView(this)
-        chip.textSize = 14f
-        chip.setTextColor(Color.WHITE)
-        chip.setTypeface(null, Typeface.BOLD)
-        chip.gravity = Gravity.CENTER
-        chip.setPadding(dp(14), dp(7), dp(14), dp(7))
-        fun styleChip() {
-            chip.text = if (autoMode) "Auto ON" else "Auto OFF"
-            chip.background = rounded(
-                if (autoMode) Color.parseColor("#2E7D32") else Color.parseColor("#3A3A3A"), 16
-            )
-        }
-        styleChip()
-        chip.setOnClickListener {
+        val mode = boldLabel(if (idMode) "ID Card Scan" else "Document Scan", 15f, Color.WHITE)
+        mode.gravity = Gravity.CENTER
+        mode.setPadding(dp(16), 0, dp(16), 0)
+        mode.background = rounded(CIRCLE_BG, 22)
+        val ml = lp(WRAP, dp(44))
+        ml.leftMargin = dp(10)
+        top.addView(mode, ml)
+        top.addView(View(this), lp(0, 1, 1f))
+
+        val autoPill = LinearLayout(this)
+        autoPill.orientation = LinearLayout.HORIZONTAL
+        autoPill.gravity = Gravity.CENTER
+        autoPill.setPadding(dp(12), 0, dp(14), 0)
+        autoPill.background = rounded(CIRCLE_BG, 22)
+        val ai = IconView(this, 11, false, Color.WHITE)
+        autoIcon = ai
+        autoPill.addView(ai, lp(dp(22), dp(22)))
+        val al = boldLabel("Auto", 15f, Color.WHITE)
+        al.setPadding(dp(6), 0, 0, 0)
+        autoLabel = al
+        autoPill.addView(al)
+        autoPill.setOnClickListener {
             autoMode = !autoMode
-            styleChip()
+            updateAutoPill()
             if (!autoMode) detectView?.update(null, 0.75f, idleHint())
         }
-        top.addView(chip, FrameLayout.LayoutParams(WRAP, WRAP, Gravity.CENTER))
+        top.addView(autoPill, lp(WRAP, dp(44)))
+        updateAutoPill()
 
-        val flash = iconText(if (torchOn) "Flash ON" else "Flash OFF", 15f) { }
-        flash.setTextColor(if (torchOn) Color.YELLOW else Color.WHITE)
-        flash.setOnClickListener { toggleTorch(flash) }
-        top.addView(
-            flash,
-            FrameLayout.LayoutParams(WRAP, WRAP, Gravity.END or Gravity.CENTER_VERTICAL)
-        )
-        root.addView(top, lp(MATCH, dp(76)))
+        val flashBtn = FrameLayout(this)
+        flashBtn.background = oval(CIRCLE_BG)
+        val fi = IconView(this, 9, false, if (torchOn) Color.YELLOW else Color.WHITE)
+        flashIcon = fi
+        flashBtn.addView(fi, FrameLayout.LayoutParams(dp(44), dp(44)))
+        flashBtn.setOnClickListener { toggleTorch() }
+        val fl = lp(dp(44), dp(44))
+        fl.leftMargin = dp(8)
+        top.addView(flashBtn, fl)
+        root.addView(top, lp(MATCH, WRAP))
 
         val container = FrameLayout(this)
         val pv = PreviewView(this)
@@ -1612,6 +1923,7 @@ class MainActivity : ComponentActivity() {
         container.addView(pv, FrameLayout.LayoutParams(MATCH, MATCH))
 
         val dv = DetectView(this)
+        dv.showFrame = idMode
         detectView = dv
         dv.update(null, 0.75f, idleHint())
         container.addView(dv, FrameLayout.LayoutParams(MATCH, MATCH))
@@ -1642,54 +1954,66 @@ class MainActivity : ComponentActivity() {
         root.addView(container, lp(MATCH, 0, 1f))
 
         val bar = FrameLayout(this)
-        bar.setPadding(dp(16), dp(12), dp(16), dp(20))
+        bar.setPadding(dp(20), dp(10), dp(20), dp(22))
 
         val galleryBox = FrameLayout(this)
-        galleryBox.background = rounded(Color.parseColor("#3A3A3A"), 16)
-        galleryBox.addView(IconView(this, 2), FrameLayout.LayoutParams(dp(72), dp(72)))
+        galleryBox.background = rounded(CIRCLE_BG, 20)
+        galleryBox.addView(IconView(this, 2, false, Color.WHITE), FrameLayout.LayoutParams(dp(56), dp(56)))
         galleryBox.setOnClickListener { galleryLauncher.launch("image/*") }
         bar.addView(
             galleryBox,
-            FrameLayout.LayoutParams(dp(72), dp(72), Gravity.START or Gravity.CENTER_VERTICAL)
+            FrameLayout.LayoutParams(dp(56), dp(56), Gravity.START or Gravity.CENTER_VERTICAL)
         )
 
-        val cap = View(this)
-        val capBg = GradientDrawable()
-        capBg.shape = GradientDrawable.OVAL
-        capBg.setColor(Color.WHITE)
-        capBg.setStroke(dp(5), Color.parseColor("#9E9E9E"))
-        cap.background = capBg
-        cap.setOnClickListener { takePhoto(null) }
-        bar.addView(cap, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.CENTER))
+        val shutter = ShutterView(this)
+        shutter.setOnClickListener { takePhoto(null) }
+        bar.addView(shutter, FrameLayout.LayoutParams(dp(78), dp(78), Gravity.CENTER))
 
-        val pw = FrameLayout(this)
-        val pbtn = TextView(this)
-        pbtn.text = "Proceed"
-        pbtn.textSize = 15f
-        pbtn.setTextColor(Color.WHITE)
-        pbtn.setTypeface(null, Typeface.BOLD)
-        pbtn.gravity = Gravity.CENTER
-        pbtn.background = rounded(GREEN, 32)
-        pbtn.setOnClickListener { proceed() }
-        pw.addView(pbtn, FrameLayout.LayoutParams(dp(112), dp(64), Gravity.CENTER))
-        val pb = badge()
-        proceedBadge = pb
-        pw.addView(pb, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.TOP or Gravity.END))
-        bar.addView(
-            pw,
-            FrameLayout.LayoutParams(dp(124), dp(80), Gravity.END or Gravity.CENTER_VERTICAL)
-        )
+        counterView = null
+        proceedBadge = null
+        if (idMode) {
+            val cb = TextView(this)
+            cb.text = "0/2"
+            cb.textSize = 18f
+            cb.setTextColor(Color.WHITE)
+            cb.setTypeface(null, Typeface.BOLD)
+            cb.gravity = Gravity.CENTER
+            cb.background = rounded(CIRCLE_BG, 20)
+            cb.setOnClickListener { proceed() }
+            counterView = cb
+            bar.addView(
+                cb,
+                FrameLayout.LayoutParams(dp(56), dp(56), Gravity.END or Gravity.CENTER_VERTICAL)
+            )
+        } else {
+            val pw = FrameLayout(this)
+            val pbtn = TextView(this)
+            pbtn.text = "Proceed"
+            pbtn.textSize = 15f
+            pbtn.setTextColor(Color.WHITE)
+            pbtn.setTypeface(null, Typeface.BOLD)
+            pbtn.gravity = Gravity.CENTER
+            pbtn.background = rounded(GREEN, 32)
+            pbtn.setOnClickListener { proceed() }
+            pw.addView(pbtn, FrameLayout.LayoutParams(dp(104), dp(60), Gravity.CENTER))
+            val pb = badge()
+            proceedBadge = pb
+            pw.addView(pb, FrameLayout.LayoutParams(dp(24), dp(24), Gravity.TOP or Gravity.END))
+            bar.addView(
+                pw,
+                FrameLayout.LayoutParams(dp(116), dp(76), Gravity.END or Gravity.CENTER_VERTICAL)
+            )
+        }
 
         root.addView(bar, lp(MATCH, dp(116)))
         setContentView(root)
         refreshOverlay()
 
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
+        if (hasCamera()) {
             startCamera()
         } else {
-            permLauncher.launch(Manifest.permission.CAMERA)
+            val miss = missingPerms()
+            if (miss.isNotEmpty()) permAll.launch(miss)
         }
     }
 
@@ -1719,7 +2043,18 @@ class MainActivity : ComponentActivity() {
             }
         })
         try {
-            showHome()
+            val mode = intent?.getStringExtra("mode")
+            if (mode == "scan") {
+                startScanMode(false)
+            } else if (mode == "id") {
+                startScanMode(true)
+            } else {
+                showHome()
+                if (savedInstanceState == null) {
+                    val miss = missingPerms()
+                    if (miss.isNotEmpty()) permAll.launch(miss)
+                }
+            }
         } catch (e: Throwable) {
             showError(e)
         }
