@@ -57,6 +57,16 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import com.google.android.gms.ads.AdError
+import com.google.android.gms.ads.AdRequest
+import com.google.android.gms.ads.FullScreenContentCallback
+import com.google.android.gms.ads.LoadAdError
+import com.google.android.gms.ads.MobileAds
+import com.google.android.gms.ads.interstitial.InterstitialAd
+import com.google.android.gms.ads.interstitial.InterstitialAdLoadCallback
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
@@ -71,6 +81,13 @@ class PdfItem(val uri: Uri, val name: String, val dateSec: Long, val size: Long)
 class MainActivity : ComponentActivity() {
 
     private val AUTH = "com.akay.pdfscanner.fileprovider"
+
+    // Google TEST ad unit (safe for testing). Replace with your real ad unit ID before publishing.
+    private val AD_UNIT_ID = "ca-app-pub-3940256099942544/1033173712"
+
+    // Minimum gap between two ads in milliseconds (0 = ad on every click, for testing).
+    private val AD_GAP_MS = 0L
+
     private val DARK = Color.parseColor("#1C1C1C")
     private val CIRCLE_BG = Color.parseColor("#3A3A3A")
     private val GREEN = Color.parseColor("#2E9E5B")
@@ -127,6 +144,12 @@ class MainActivity : ComponentActivity() {
     private var autoWarned = false
     private var errLogged = 0
 
+    private var interstitial: InterstitialAd? = null
+    private var adLoading = false
+    private var adShowing = false
+    private var lastAdAt = 0L
+    private var afterMedia: (() -> Unit)? = null
+
     private val thumbCache = HashMap<String, Bitmap>()
     private val pageCountCache = HashMap<String, Int>()
 
@@ -139,6 +162,20 @@ class MainActivity : ComponentActivity() {
     ) { _ ->
         if (screen == "camera") {
             if (hasCamera()) startCamera() else toast("Camera permission is required. Allow it in phone Settings.")
+        }
+    }
+
+    private val mediaPermLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        val cb = afterMedia
+        afterMedia = null
+        if (granted) {
+            cb?.invoke()
+        } else if (shouldShowRequestPermissionRationale(mediaPerm())) {
+            toast("Photos and media permission is required for this.")
+        } else {
+            showSettingsDialog()
         }
     }
 
@@ -170,14 +207,42 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun bars(color: Int, light: Boolean) {
-        window.statusBarColor = color
-        var f = window.decorView.systemUiVisibility
-        f = if (light) {
-            f or View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
-        } else {
-            f and View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR.inv()
+        try {
+            window.statusBarColor = color
+        } catch (e: Throwable) {
         }
-        window.decorView.systemUiVisibility = f
+        WindowInsetsControllerCompat(window, window.decorView).isAppearanceLightStatusBars = light
+    }
+
+    // Shows a screen and keeps status/navigation bar areas coloured (needed for Android 15+ edge-to-edge)
+    private fun setScreen(content: View, top: Int, bottom: Int, lightStatus: Boolean, lightNav: Boolean) {
+        bars(top, lightStatus)
+        val wrap = LinearLayout(this)
+        wrap.orientation = LinearLayout.VERTICAL
+        wrap.setBackgroundColor(bottom)
+        val topPad = View(this)
+        topPad.setBackgroundColor(top)
+        val botPad = View(this)
+        botPad.setBackgroundColor(bottom)
+        wrap.addView(topPad, lp(MATCH, 0))
+        wrap.addView(content, lp(MATCH, 0, 1f))
+        wrap.addView(botPad, lp(MATCH, 0))
+        ViewCompat.setOnApplyWindowInsetsListener(wrap) { _, insets ->
+            val sb = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
+            )
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            (topPad.layoutParams as LinearLayout.LayoutParams).height = sb.top
+            (botPad.layoutParams as LinearLayout.LayoutParams).height = maxOf(sb.bottom, ime.bottom)
+            topPad.requestLayout()
+            botPad.requestLayout()
+            WindowInsetsCompat.CONSUMED
+        }
+        setContentView(wrap)
+        if (Build.VERSION.SDK_INT >= 35) {
+            WindowInsetsControllerCompat(window, wrap).isAppearanceLightNavigationBars = lightNav
+        }
+        ViewCompat.requestApplyInsets(wrap)
     }
 
     private fun rounded(color: Int, radius: Int): GradientDrawable {
@@ -269,18 +334,132 @@ class MainActivity : ComponentActivity() {
         ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
             PackageManager.PERMISSION_GRANTED
 
+    // ---------- media permission (gallery + saving) ----------
+
+    private fun mediaPerm(): String =
+        if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.READ_MEDIA_IMAGES
+        } else {
+            Manifest.permission.READ_EXTERNAL_STORAGE
+        }
+
+    private fun hasMedia(): Boolean =
+        ContextCompat.checkSelfPermission(this, mediaPerm()) == PackageManager.PERMISSION_GRANTED
+
+    private fun withMedia(action: () -> Unit) {
+        if (hasMedia()) {
+            action()
+        } else {
+            afterMedia = action
+            mediaPermLauncher.launch(mediaPerm())
+        }
+    }
+
+    private fun showSettingsDialog() {
+        val dlg = AlertDialog.Builder(this)
+            .setMessage("Photos and media permission is needed. Please allow it in Settings.")
+            .setPositiveButton("Open Settings") { _, _ ->
+                try {
+                    val i = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                    i.data = Uri.parse("package:$packageName")
+                    startActivity(i)
+                } catch (e: Throwable) {
+                    toast("Open Settings > Apps > PDF Scanner > Permissions")
+                }
+            }
+            .setNegativeButton("Cancel", null)
+            .create()
+        dlg.show()
+        dlg.getButton(DialogInterface.BUTTON_POSITIVE).setTextColor(BLUE)
+        dlg.getButton(DialogInterface.BUTTON_NEGATIVE).setTextColor(BLUE)
+    }
+
     private fun missingPerms(): Array<String> {
         val l = ArrayList<String>()
         l.add(Manifest.permission.CAMERA)
-        if (Build.VERSION.SDK_INT >= 33) {
-            l.add(Manifest.permission.READ_MEDIA_IMAGES)
-        } else {
-            l.add(Manifest.permission.READ_EXTERNAL_STORAGE)
-        }
+        l.add(mediaPerm())
         return l.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }.toTypedArray()
     }
+
+    // ---------- ads (Google test interstitial) ----------
+
+    private fun startAds() {
+        Thread {
+            try {
+                MobileAds.initialize(this) { runOnUiThread { loadInterstitial() } }
+            } catch (e: Throwable) {
+                Log.e("PDFScanner", "Ads init failed", e)
+            }
+        }.start()
+    }
+
+    private fun loadInterstitial() {
+        if (adLoading || interstitial != null) return
+        adLoading = true
+        try {
+            InterstitialAd.load(
+                this, AD_UNIT_ID, AdRequest.Builder().build(),
+                object : InterstitialAdLoadCallback() {
+                    override fun onAdLoaded(ad: InterstitialAd) {
+                        interstitial = ad
+                        adLoading = false
+                        Log.i("PDFScanner", "Ad loaded")
+                    }
+
+                    override fun onAdFailedToLoad(err: LoadAdError) {
+                        interstitial = null
+                        adLoading = false
+                        Log.w("PDFScanner", "Ad failed to load: ${err.message}")
+                    }
+                }
+            )
+        } catch (e: Throwable) {
+            adLoading = false
+            Log.e("PDFScanner", "Ad load error", e)
+        }
+    }
+
+    // Shows an ad (if ready), then runs the action. If no ad is ready, runs the action at once.
+    private fun runWithAd(action: () -> Unit) {
+        if (adShowing) return
+        val ad = interstitial
+        val now = System.currentTimeMillis()
+        if (ad == null || now - lastAdAt < AD_GAP_MS) {
+            loadInterstitial()
+            action()
+            return
+        }
+        interstitial = null
+        adShowing = true
+        var done = false
+        fun continueAfterAd() {
+            if (done) return
+            done = true
+            adShowing = false
+            lastAdAt = System.currentTimeMillis()
+            loadInterstitial()
+            action()
+        }
+        ad.fullScreenContentCallback = object : FullScreenContentCallback() {
+            override fun onAdDismissedFullScreenContent() {
+                continueAfterAd()
+            }
+
+            override fun onAdFailedToShowFullScreenContent(e: AdError) {
+                Log.w("PDFScanner", "Ad failed to show: ${e.message}")
+                continueAfterAd()
+            }
+        }
+        try {
+            ad.show(this)
+        } catch (e: Throwable) {
+            continueAfterAd()
+        }
+    }
+
+    // ---------- images ----------
 
     private fun exifDegrees(ei: ExifInterface): Int {
         return when (ei.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
@@ -805,7 +984,6 @@ class MainActivity : ComponentActivity() {
         screen = "crop"
         cropIndex = i
         stopCamera()
-        bars(Color.parseColor("#121212"), false)
         val n = pages.size
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -856,7 +1034,7 @@ class MainActivity : ComponentActivity() {
         bar.addView(reset, lp(WRAP, WRAP))
         bar.addView(pill("Next  \u2192", GREEN) { cropNext() }, lp(0, dp(56), 1.15f))
         root.addView(bar)
-        setContentView(root)
+        setScreen(root, Color.parseColor("#121212"), Color.parseColor("#121212"), false, false)
     }
 
     private fun saveCurrentPts() {
@@ -1037,7 +1215,7 @@ class MainActivity : ComponentActivity() {
 
     private fun showNext() {
         screen = "next"
-        bars(Color.parseColor("#EAF2FF"), true)
+        loadInterstitial()
         if (scanName.isEmpty()) scanName = "Scan_" + stamp()
 
         val sv = ScrollView(this)
@@ -1173,7 +1351,9 @@ class MainActivity : ComponentActivity() {
         val jl = lp(0, dp(60), 1f)
         jl.rightMargin = dp(8)
         two.addView(jpg, jl)
-        val shr = bigButton(8, "Share", Color.parseColor("#00B976"), 60, 17f) { showShareSheet() }
+        val shr = bigButton(8, "Share", Color.parseColor("#00B976"), 60, 17f) {
+            runWithAd { showShareSheet() }
+        }
         val sl = lp(0, dp(60), 1f)
         sl.leftMargin = dp(8)
         two.addView(shr, sl)
@@ -1185,15 +1365,17 @@ class MainActivity : ComponentActivity() {
         home.gravity = Gravity.CENTER
         home.setPadding(0, dp(18), 0, dp(18))
         home.setOnClickListener {
-            resetAll()
-            showHome()
+            runWithAd {
+                resetAll()
+                showHome()
+            }
         }
         val hml = lp(MATCH, WRAP)
         hml.topMargin = dp(12)
         col.addView(home, hml)
 
         sv.addView(col)
-        setContentView(sv)
+        setScreen(sv, Color.parseColor("#EAF2FF"), Color.WHITE, true, true)
     }
 
     private fun leaveFinal() {
@@ -1350,7 +1532,12 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Save needs media permission, then shows an ad, then saves.
     private fun doSave(asPdf: Boolean) {
+        withMedia { runWithAd { doSaveNow(asPdf) } }
+    }
+
+    private fun doSaveNow(asPdf: Boolean) {
         if (busy) return
         busy = true
         val base = baseName()
@@ -1718,7 +1905,6 @@ class MainActivity : ComponentActivity() {
 
     private fun showHome() {
         screen = "home"
-        bars(Color.parseColor("#07B3FF"), false)
         val pdfs = loadPdfs()
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
@@ -1772,12 +1958,11 @@ class MainActivity : ComponentActivity() {
         val sv = ScrollView(this)
         sv.setBackgroundColor(Color.parseColor("#F6F8FD"))
         sv.addView(content)
-        setContentView(sv)
+        setScreen(sv, Color.parseColor("#07B3FF"), Color.parseColor("#F6F8FD"), false, true)
     }
 
     private fun showImport() {
         screen = "import"
-        bars(Color.parseColor("#07B3FF"), false)
         val content = LinearLayout(this)
         content.orientation = LinearLayout.VERTICAL
         content.addView(blueHeader(1), lp(MATCH, WRAP))
@@ -1813,12 +1998,11 @@ class MainActivity : ComponentActivity() {
         val sv = ScrollView(this)
         sv.setBackgroundColor(Color.parseColor("#F6F8FD"))
         sv.addView(content)
-        setContentView(sv)
+        setScreen(sv, Color.parseColor("#07B3FF"), Color.parseColor("#F6F8FD"), false, true)
     }
 
     private fun showAll() {
         screen = "all"
-        bars(Color.parseColor("#07B3FF"), false)
         val pdfs = loadPdfs()
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -1851,7 +2035,7 @@ class MainActivity : ComponentActivity() {
         bar.setPadding(dp(16), dp(8), dp(16), dp(20))
         bar.addView(pill("Back", Color.parseColor("#78909C")) { showHome() }, lp(dp(110), dp(52)))
         root.addView(bar)
-        setContentView(root)
+        setScreen(root, Color.parseColor("#07B3FF"), Color.parseColor("#F6F8FD"), false, true)
     }
 
     // ---------- Stage 2: camera screen ----------
@@ -1864,7 +2048,6 @@ class MainActivity : ComponentActivity() {
 
     private fun showCamera() {
         screen = "camera"
-        bars(DARK, false)
         resetAutoState()
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
@@ -1959,7 +2142,7 @@ class MainActivity : ComponentActivity() {
         val galleryBox = FrameLayout(this)
         galleryBox.background = rounded(CIRCLE_BG, 20)
         galleryBox.addView(IconView(this, 2, false, Color.WHITE), FrameLayout.LayoutParams(dp(56), dp(56)))
-        galleryBox.setOnClickListener { galleryLauncher.launch("image/*") }
+        galleryBox.setOnClickListener { withMedia { galleryLauncher.launch("image/*") } }
         bar.addView(
             galleryBox,
             FrameLayout.LayoutParams(dp(56), dp(56), Gravity.START or Gravity.CENTER_VERTICAL)
@@ -2006,7 +2189,7 @@ class MainActivity : ComponentActivity() {
         }
 
         root.addView(bar, lp(MATCH, dp(116)))
-        setContentView(root)
+        setScreen(root, DARK, DARK, false, false)
         refreshOverlay()
 
         if (hasCamera()) {
@@ -2042,6 +2225,7 @@ class MainActivity : ComponentActivity() {
                 }
             }
         })
+        startAds()
         try {
             val mode = intent?.getStringExtra("mode")
             if (mode == "scan") {
