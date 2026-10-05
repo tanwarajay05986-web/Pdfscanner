@@ -13,7 +13,7 @@ jobs:
           java-version: 17
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.9
+          gradle-version: 8.13
       - run: gradle assembleDebug
       - uses: actions/upload-artifact@v4
         with:
@@ -27,7 +27,7 @@ jobs:
       - name: Test on emulator
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: 34
+          api-level: 35
           target: google_apis
           arch: x86_64
           script: |
@@ -36,8 +36,8 @@ jobs:
             adb shell pm grant com.akay.pdfscanner android.permission.READ_MEDIA_IMAGES || true
             adb logcat -c
             adb shell am start -W -n com.akay.pdfscanner/.MainActivity --es mode scan
-            sleep 25
-            adb logcat -d | grep -E "AndroidRuntime|FATAL|akay|PDFScanner" | tail -n 80 > crash.txt
+            sleep 30
+            adb logcat -d | grep -E "AndroidRuntime|FATAL|akay|PDFScanner|Ads" | tail -n 100 > crash.txt
       - name: Show result
         if: always()
         run: |
