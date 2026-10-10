@@ -31,6 +31,10 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.TextUtils
 import android.util.Log
+import android.util.LruCache
+import android.view.ViewGroup
+import android.widget.BaseAdapter
+import android.widget.ListView
 import android.view.Gravity
 import android.view.View
 import android.view.Window
@@ -1345,6 +1349,11 @@ class MainActivity : ComponentActivity() {
         spl.topMargin = dp(28)
         col.addView(savePdf, spl)
 
+        val viewPdfBtn = bigButton(7, "View PDF", Color.parseColor("#6C4DFF"), 60, 17f) { showPdfView() }
+        val vpl = lp(MATCH, dp(60))
+        vpl.topMargin = dp(16)
+        col.addView(viewPdfBtn, vpl)
+
         val two = LinearLayout(this)
         two.orientation = LinearLayout.HORIZONTAL
         val jpg = bigButton(2, "Save as JPG", Color.parseColor("#FFB800"), 60, 17f) { doSave(false) }
@@ -1376,6 +1385,111 @@ class MainActivity : ComponentActivity() {
 
         sv.addView(col)
         setScreen(sv, Color.parseColor("#EAF2FF"), Color.WHITE, true, true)
+    }
+
+    // ---------- View PDF: preview screen, Save PDF stays pinned at the top ----------
+
+    private val viewWorker = Executors.newSingleThreadExecutor()
+
+    private val viewCache = object : LruCache<Int, Bitmap>(20 * 1024 * 1024) {
+        override fun sizeOf(key: Int, value: Bitmap): Int = value.byteCount
+    }
+
+    private fun showPdfView() {
+        screen = "view"
+        scanName = baseName()
+        viewCache.evictAll()
+        val files = edited.toList()
+        val bgc = Color.parseColor("#EEF2F8")
+
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(bgc)
+
+        val bar = LinearLayout(this)
+        bar.orientation = LinearLayout.HORIZONTAL
+        bar.gravity = Gravity.CENTER_VERTICAL
+        bar.setBackgroundColor(Color.WHITE)
+        bar.elevation = dp(4).toFloat()
+        bar.setPadding(dp(12), dp(10), dp(14), dp(10))
+
+        val back = FrameLayout(this)
+        back.addView(IconView(this, 13, false, NAVY, 0.08f), FrameLayout.LayoutParams(dp(44), dp(44)))
+        back.setOnClickListener { showNext() }
+        bar.addView(back, lp(dp(44), dp(44)))
+
+        val tcol = LinearLayout(this)
+        tcol.orientation = LinearLayout.VERTICAL
+        tcol.setPadding(dp(8), 0, dp(8), 0)
+        tcol.addView(boldLabel("PDF preview", 18f, NAVY))
+        val pc = if (files.size == 1) "1 page" else "${files.size} pages"
+        tcol.addView(label(pc, 13f, GRAY))
+        bar.addView(tcol, lp(0, WRAP, 1f))
+
+        val save = bigButton(6, "Save PDF", Color.parseColor("#1B5BFF"), 46, 16f) { doSave(true) }
+        save.setPadding(dp(18), 0, dp(20), 0)
+        bar.addView(save, lp(WRAP, dp(46)))
+        root.addView(bar, lp(MATCH, WRAP))
+
+        val sizes = ArrayList<FloatArray>()
+        for (f in files) {
+            val o = BitmapFactory.Options()
+            o.inJustDecodeBounds = true
+            BitmapFactory.decodeFile(f.absolutePath, o)
+            sizes.add(floatArrayOf(maxOf(1, o.outWidth).toFloat(), maxOf(1, o.outHeight).toFloat()))
+        }
+        val pageW = resources.displayMetrics.widthPixels - dp(28)
+
+        val lv = ListView(this)
+        lv.divider = null
+        lv.dividerHeight = 0
+        lv.setBackgroundColor(bgc)
+        lv.setPadding(dp(14), dp(14), dp(14), dp(14))
+        lv.clipToPadding = false
+        lv.isVerticalScrollBarEnabled = false
+        lv.selector = ColorDrawable(Color.TRANSPARENT)
+        lv.adapter = object : BaseAdapter() {
+            override fun getCount(): Int = files.size
+            override fun getItem(position: Int): Any = files[position]
+            override fun getItemId(position: Int): Long = position.toLong()
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                val cell = (convertView as? FrameLayout) ?: FrameLayout(this@MainActivity).also { c ->
+                    val v = ImageView(this@MainActivity)
+                    v.scaleType = ImageView.ScaleType.FIT_XY
+                    v.setBackgroundColor(Color.WHITE)
+                    v.elevation = dp(3).toFloat()
+                    c.addView(v, FrameLayout.LayoutParams(pageW, dp(100)))
+                    c.setPadding(0, 0, 0, dp(14))
+                }
+                val iv = cell.getChildAt(0) as ImageView
+                val sz = sizes[position]
+                val h = (pageW * sz[1] / sz[0]).toInt()
+                val l = iv.layoutParams
+                l.width = pageW
+                l.height = h
+                iv.layoutParams = l
+                iv.tag = position
+                val cached = viewCache.get(position)
+                if (cached != null) {
+                    iv.setImageBitmap(cached)
+                } else {
+                    iv.setImageDrawable(null)
+                    val pos = position
+                    viewWorker.execute {
+                        val bmp = thumb(files[pos], maxOf(pageW, h) * 3 / 2)
+                        if (bmp != null) {
+                            runOnUiThread {
+                                viewCache.put(pos, bmp)
+                                if (iv.tag == pos) iv.setImageBitmap(bmp)
+                            }
+                        }
+                    }
+                }
+                return cell
+            }
+        }
+        root.addView(lv, lp(MATCH, 0, 1f))
+        setScreen(root, Color.WHITE, bgc, true, true)
     }
 
     private fun leaveFinal() {
@@ -2220,6 +2334,7 @@ class MainActivity : ComponentActivity() {
                     "camera" -> leaveCamera()
                     "crop" -> cropBack()
                     "next" -> leaveFinal()
+                    "view" -> showNext()
                     "all", "import" -> showHome()
                     else -> finish()
                 }
